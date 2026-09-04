@@ -1,6 +1,8 @@
-use crate::{firewall, network, sockets, InspectorTab, Rule, SocketTab};
+use crate::{
+    firewall, network, sockets, FirewallChain, FirewallTable, InspectorTab, Rule, RulesetSnapshot,
+    SocketTab,
+};
 use ratatui::widgets::{ListState, TableState};
-use std::collections::HashSet;
 
 #[derive(Debug, Default)]
 pub(crate) struct TextField {
@@ -69,6 +71,7 @@ impl TextField {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Focus {
     Sidebar,
+    Chains,
     Table,
 }
 
@@ -332,9 +335,13 @@ impl RuleForm {
 }
 
 pub(crate) struct App {
+    pub(crate) tables: Vec<FirewallTable>,
+    pub(crate) chains: Vec<FirewallChain>,
     pub(crate) rules: Vec<Rule>,
     pub(crate) sidebar_items: Vec<String>,
     pub(crate) sidebar_state: ListState,
+    pub(crate) visible_chains: Vec<usize>,
+    pub(crate) chain_state: ListState,
     pub(crate) visible: Vec<usize>,
     pub(crate) table_state: TableState,
     pub(crate) focus: Focus,
@@ -403,9 +410,13 @@ impl SocketInspectorTab {
 impl App {
     pub(crate) fn new() -> Self {
         Self {
+            tables: Vec::new(),
+            chains: Vec::new(),
             rules: Vec::new(),
             sidebar_items: vec!["ALL".to_string()],
             sidebar_state: ListState::default(),
+            visible_chains: Vec::new(),
+            chain_state: ListState::default(),
             visible: Vec::new(),
             table_state: TableState::default(),
             focus: Focus::Sidebar,
@@ -442,18 +453,130 @@ impl App {
     }
 
     pub(crate) fn update_sidebar(&mut self) {
-        let mut set = HashSet::new();
-        set.insert("ALL".to_string());
-        for r in &self.rules {
-            set.insert(format!("{}/{}", r.family, r.table));
-        }
-        let mut list: Vec<String> = set.into_iter().collect();
-        list.sort();
-        self.sidebar_items = list;
-        if self.sidebar_state.selected().is_none() {
-            self.sidebar_state.select(Some(0));
-        }
+        let selected = self
+            .sidebar_state
+            .selected()
+            .and_then(|index| self.sidebar_items.get(index))
+            .cloned();
+        self.tables
+            .sort_by(|a, b| (&a.family, &a.name).cmp(&(&b.family, &b.name)));
+        self.sidebar_items = std::iter::once("ALL".to_string())
+            .chain(
+                self.tables
+                    .iter()
+                    .map(|table| format!("{}/{}", table.family, table.name)),
+            )
+            .collect();
+        let selected_index = selected
+            .and_then(|label| self.sidebar_items.iter().position(|item| item == &label))
+            .unwrap_or(0);
+        self.sidebar_state.select(Some(selected_index));
         self.repair_selection();
+        self.recompute_chains();
+    }
+
+    pub(crate) fn apply_firewall_snapshot(&mut self, snapshot: RulesetSnapshot) {
+        let selected_chain = self.selected_firewall_chain().map(|chain| {
+            (
+                chain.family.clone(),
+                chain.table.clone(),
+                chain.name.clone(),
+            )
+        });
+        self.tables = snapshot.tables;
+        self.chains = snapshot.chains;
+        self.rules = snapshot.rules;
+        self.visible_chains.clear();
+        self.chain_state.select(Some(0));
+        self.update_sidebar();
+        if let Some(identity) = selected_chain {
+            if let Some(position) = self.visible_chains.iter().position(|index| {
+                let chain = &self.chains[*index];
+                (
+                    chain.family.clone(),
+                    chain.table.clone(),
+                    chain.name.clone(),
+                ) == identity
+            }) {
+                self.chain_state.select(Some(position + 1));
+            }
+        }
+        self.recompute_visible();
+    }
+
+    pub(crate) fn selected_firewall_table(&self) -> Option<&FirewallTable> {
+        self.sidebar_state
+            .selected()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| self.tables.get(index))
+    }
+
+    pub(crate) fn selected_firewall_chain(&self) -> Option<&FirewallChain> {
+        self.chain_state
+            .selected()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| self.visible_chains.get(index))
+            .and_then(|index| self.chains.get(*index))
+    }
+
+    pub(crate) fn new_rule_form_for_selection(&self) -> RuleForm {
+        let mut form = RuleForm::new();
+        if let Some(table) = self.selected_firewall_table() {
+            form.family = TextField::from(&table.family);
+            form.table = TextField::from(&table.name);
+            form.structured[0] = TextField::from(&table.family);
+            form.structured[1] = TextField::from(&table.name);
+            form.chain.clear();
+            form.structured[2].clear();
+        }
+        if let Some(chain) = self.selected_firewall_chain() {
+            form.chain = TextField::from(&chain.name);
+            form.structured[2] = TextField::from(&chain.name);
+        }
+        form
+    }
+
+    pub(crate) fn recompute_chains(&mut self) {
+        let selected_identity = self.selected_firewall_chain().map(|chain| {
+            (
+                chain.family.clone(),
+                chain.table.clone(),
+                chain.name.clone(),
+            )
+        });
+        let selected_table = self
+            .selected_firewall_table()
+            .map(|table| (table.family.clone(), table.name.clone()));
+        self.visible_chains = self
+            .chains
+            .iter()
+            .enumerate()
+            .filter(|(_, chain)| {
+                selected_table
+                    .as_ref()
+                    .is_none_or(|(family, table)| chain.family == *family && chain.table == *table)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.visible_chains.sort_by(|left, right| {
+            let left = &self.chains[*left];
+            let right = &self.chains[*right];
+            (&left.family, &left.table, &left.name).cmp(&(&right.family, &right.table, &right.name))
+        });
+        let selection = selected_identity
+            .and_then(|identity| {
+                self.visible_chains.iter().position(|index| {
+                    let chain = &self.chains[*index];
+                    (
+                        chain.family.clone(),
+                        chain.table.clone(),
+                        chain.name.clone(),
+                    ) == identity
+                })
+            })
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.chain_state.select(Some(selection));
     }
 
     pub(crate) fn recompute_visible(&mut self) {
@@ -461,25 +584,32 @@ impl App {
             .selected_rule()
             .map(|r| (r.family.clone(), r.table.clone(), r.chain.clone(), r.handle));
         let q = self.filter.value.trim().to_lowercase();
-        let selected_tree = self
-            .sidebar_state
-            .selected()
-            .and_then(|i| self.sidebar_items.get(i))
-            .cloned()
-            .unwrap_or_else(|| "ALL".to_string());
+        let selected_table = self
+            .selected_firewall_table()
+            .map(|table| (table.family.clone(), table.name.clone()));
+        let selected_chain = self.selected_firewall_chain().map(|chain| {
+            (
+                chain.family.clone(),
+                chain.table.clone(),
+                chain.name.clone(),
+            )
+        });
 
         self.visible = self
             .rules
             .iter()
             .enumerate()
             .filter(|(_, r)| {
-                let matches_tree = if selected_tree == "ALL" {
-                    true
-                } else {
-                    format!("{}/{}", r.family, r.table) == selected_tree
-                };
+                let matches_tree = selected_table
+                    .as_ref()
+                    .is_none_or(|(family, table)| r.family == *family && r.table == *table);
+                let matches_chain = selected_chain
+                    .as_ref()
+                    .is_none_or(|(family, table, chain)| {
+                        r.family == *family && r.table == *table && r.chain == *chain
+                    });
                 let matches_q = q.is_empty() || r.matches_filter(&q);
-                matches_tree && matches_q
+                matches_tree && matches_chain && matches_q
             })
             .map(|(i, _)| i)
             .collect();
@@ -524,8 +654,15 @@ impl App {
                         None => 0,
                     };
                     self.sidebar_state.select(Some(i));
+                    self.recompute_chains();
                     self.recompute_visible();
                 }
+            }
+            Focus::Chains => {
+                let count = self.visible_chains.len() + 1;
+                let index = (self.chain_state.selected().unwrap_or(0) + 1) % count;
+                self.chain_state.select(Some(index));
+                self.recompute_visible();
             }
             Focus::Table => {
                 if !self.visible.is_empty() {
@@ -554,8 +691,16 @@ impl App {
                         None => 0,
                     };
                     self.sidebar_state.select(Some(i));
+                    self.recompute_chains();
                     self.recompute_visible();
                 }
+            }
+            Focus::Chains => {
+                let count = self.visible_chains.len() + 1;
+                let current = self.chain_state.selected().unwrap_or(0);
+                self.chain_state
+                    .select(Some(if current == 0 { count - 1 } else { current - 1 }));
+                self.recompute_visible();
             }
             Focus::Table => {
                 if !self.visible.is_empty() {
@@ -574,8 +719,13 @@ impl App {
             Focus::Sidebar => {
                 if !self.sidebar_items.is_empty() {
                     self.sidebar_state.select(Some(0));
+                    self.recompute_chains();
                     self.recompute_visible();
                 }
+            }
+            Focus::Chains => {
+                self.chain_state.select(Some(0));
+                self.recompute_visible();
             }
             Focus::Table => {
                 if !self.visible.is_empty() {
@@ -591,8 +741,13 @@ impl App {
                 if !self.sidebar_items.is_empty() {
                     self.sidebar_state
                         .select(Some(self.sidebar_items.len().saturating_sub(1)));
+                    self.recompute_chains();
                     self.recompute_visible();
                 }
+            }
+            Focus::Chains => {
+                self.chain_state.select(Some(self.visible_chains.len()));
+                self.recompute_visible();
             }
             Focus::Table => {
                 if !self.visible.is_empty() {
@@ -827,5 +982,33 @@ mod tests {
         assert_eq!(app.table_state.selected(), Some(0));
         app.go_last();
         assert_eq!(app.table_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn empty_tables_and_chains_remain_in_the_hierarchy() {
+        let mut app = App::new();
+        app.apply_firewall_snapshot(RulesetSnapshot {
+            tables: vec![FirewallTable {
+                family: "inet".into(),
+                name: "pintech".into(),
+            }],
+            chains: vec![FirewallChain {
+                family: "inet".into(),
+                table: "pintech".into(),
+                name: "pintech_input".into(),
+                chain_type: "filter".into(),
+                hook: "input".into(),
+                priority: "filter".into(),
+                policy: "accept".into(),
+            }],
+            rules: Vec::new(),
+        });
+        app.sidebar_state.select(Some(1));
+        app.recompute_chains();
+        app.recompute_visible();
+
+        assert_eq!(app.sidebar_items, vec!["ALL", "inet/pintech"]);
+        assert_eq!(app.visible_chains, vec![0]);
+        assert!(app.visible.is_empty());
     }
 }

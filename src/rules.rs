@@ -106,6 +106,30 @@ pub(crate) struct Rule {
     pub(crate) comment: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FirewallTable {
+    pub(crate) family: String,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FirewallChain {
+    pub(crate) family: String,
+    pub(crate) table: String,
+    pub(crate) name: String,
+    pub(crate) chain_type: String,
+    pub(crate) hook: String,
+    pub(crate) priority: String,
+    pub(crate) policy: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RulesetSnapshot {
+    pub(crate) tables: Vec<FirewallTable>,
+    pub(crate) chains: Vec<FirewallChain>,
+    pub(crate) rules: Vec<Rule>,
+}
+
 impl Rule {
     pub(crate) fn matches_filter(&self, q: &str) -> bool {
         self.family.to_lowercase().contains(q)
@@ -540,7 +564,113 @@ fn parse_text_ruleset(output: &str) -> HashMap<RuleKey, String> {
     rules
 }
 
-pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
+fn parse_ruleset(root: &Value, exact_rules: &HashMap<RuleKey, String>) -> RulesetSnapshot {
+    let mut snapshot = RulesetSnapshot::default();
+    let Some(nftables) = root.get("nftables").and_then(Value::as_array) else {
+        return snapshot;
+    };
+
+    for item in nftables {
+        if let Some(table) = item.get("table") {
+            let family = table
+                .get("family")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = table
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !family.is_empty()
+                && !name.is_empty()
+                && !snapshot
+                    .tables
+                    .iter()
+                    .any(|entry| entry.family == family && entry.name == name)
+            {
+                snapshot.tables.push(FirewallTable { family, name });
+            }
+            continue;
+        }
+
+        if let Some(chain) = item.get("chain") {
+            let string = |key: &str| {
+                chain
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let family = string("family");
+            let table = string("table");
+            let name = string("name");
+            if !family.is_empty() && !table.is_empty() && !name.is_empty() {
+                snapshot.chains.push(FirewallChain {
+                    family,
+                    table,
+                    name,
+                    chain_type: string("type"),
+                    hook: string("hook"),
+                    priority: chain.get("prio").map(describe_operand).unwrap_or_default(),
+                    policy: string("policy"),
+                });
+            }
+            continue;
+        }
+
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        let family = rule
+            .get("family")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let table = rule
+            .get("table")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let chain = rule
+            .get("chain")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let handle = rule.get("handle").and_then(Value::as_u64).unwrap_or(0);
+        let expr_val = rule.get("expr").cloned().unwrap_or(Value::Array(vec![]));
+        let (parsed, reconstructed_expression, verdict) = match expr_val.as_array() {
+            Some(expression) => parse_expr_structured(expression),
+            None => (
+                ParsedRuleExpr::default(),
+                "(none)".to_string(),
+                Verdict::Other,
+            ),
+        };
+        let exact_expression = exact_rules
+            .get(&(family.clone(), table.clone(), chain.clone(), handle))
+            .cloned();
+        let expression = exact_expression.clone().unwrap_or(reconstructed_expression);
+        snapshot.rules.push(Rule {
+            family,
+            table,
+            chain,
+            handle,
+            parsed,
+            expression,
+            exact_expression,
+            verdict,
+            raw: expr_val,
+            comment: rule
+                .get("comment")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    snapshot
+}
+
+pub(crate) async fn fetch_ruleset() -> Result<RulesetSnapshot> {
     let output = Command::new("nft")
         .args(["--json", "list", "ruleset"])
         .output()
@@ -564,62 +694,7 @@ pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
         }
         _ => HashMap::new(),
     };
-    let mut rules = Vec::new();
-
-    if let Some(nftables) = root.get("nftables").and_then(|v| v.as_array()) {
-        for item in nftables {
-            if let Some(rule) = item.get("rule") {
-                let family = rule
-                    .get("family")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let table = rule
-                    .get("table")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let chain = rule
-                    .get("chain")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let handle = rule.get("handle").and_then(|v| v.as_u64()).unwrap_or(0);
-                let expr_val = rule.get("expr").cloned().unwrap_or(Value::Array(vec![]));
-
-                let (parsed, reconstructed_expression, verdict) = match expr_val.as_array() {
-                    Some(arr) => parse_expr_structured(arr),
-                    None => (
-                        ParsedRuleExpr::default(),
-                        "(none)".to_string(),
-                        Verdict::Other,
-                    ),
-                };
-
-                let exact_expression = exact_rules
-                    .get(&(family.clone(), table.clone(), chain.clone(), handle))
-                    .cloned();
-                let expression = exact_expression.clone().unwrap_or(reconstructed_expression);
-
-                rules.push(Rule {
-                    family,
-                    table,
-                    chain,
-                    handle,
-                    parsed,
-                    expression,
-                    exact_expression,
-                    verdict,
-                    raw: expr_val,
-                    comment: rule
-                        .get("comment")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                });
-            }
-        }
-    }
-    Ok(rules)
+    Ok(parse_ruleset(&root, &exact_rules))
 }
 
 #[cfg(test)]
@@ -687,5 +762,37 @@ table inet pintech {
             ),
             "accept comment \"keep  counter packets 91 bytes 5684  text exactly\""
         );
+    }
+
+    #[test]
+    fn parses_empty_tables_and_chains_independently_from_rules() {
+        let root = serde_json::json!({
+            "nftables": [
+                {"metainfo": {"json_schema_version": 1}},
+                {"table": {"family": "inet", "name": "pintech"}},
+                {"chain": {
+                    "family": "inet",
+                    "table": "pintech",
+                    "name": "pintech_input",
+                    "type": "filter",
+                    "hook": "input",
+                    "prio": "filter",
+                    "policy": "accept"
+                }}
+            ]
+        });
+        let snapshot = parse_ruleset(&root, &HashMap::new());
+
+        assert_eq!(
+            snapshot.tables,
+            vec![FirewallTable {
+                family: "inet".into(),
+                name: "pintech".into()
+            }]
+        );
+        assert_eq!(snapshot.chains.len(), 1);
+        assert_eq!(snapshot.chains[0].name, "pintech_input");
+        assert_eq!(snapshot.chains[0].policy, "accept");
+        assert!(snapshot.rules.is_empty());
     }
 }

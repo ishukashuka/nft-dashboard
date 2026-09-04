@@ -9,6 +9,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    text::Line,
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
     },
@@ -47,10 +48,8 @@ async fn open_firewall(app: &mut App) {
     app.network_form = None;
     app.network_focus = false;
     match fetch_ruleset().await {
-        Ok(rules) => {
-            app.rules = rules;
-            app.update_sidebar();
-            app.recompute_visible();
+        Ok(snapshot) => {
+            app.apply_firewall_snapshot(snapshot);
             app.error_msg.clear();
             app.status_msg = "Firewall snapshot loaded".into();
             app.mode = Mode::Normal;
@@ -135,7 +134,14 @@ async fn main() -> Result<()> {
                 .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
                 .split(f.size());
 
-            let location = if app.mode == Mode::Detail { "Firewall > Rules > Inspector" } else if app.mode == Mode::Filter { "Firewall > Rules > Filter" } else { "Firewall > Rules" };
+            let hierarchy = if let Some(chain) = app.selected_firewall_chain() {
+                format!("Firewall > {}/{} > {}", chain.family, chain.table, chain.name)
+            } else if let Some(table) = app.selected_firewall_table() {
+                format!("Firewall > {}/{}", table.family, table.name)
+            } else {
+                "Firewall > All tables".to_string()
+            };
+            let location = if app.mode == Mode::Detail { format!("{} > Inspector", hierarchy) } else if app.mode == Mode::Filter { format!("{} > Filter", hierarchy) } else { hierarchy };
             let header_info = Paragraph::new(navigation(
                 &app.section,
                 format!(
@@ -151,7 +157,7 @@ async fn main() -> Result<()> {
 
             let main_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
+                .constraints([Constraint::Percentage(24), Constraint::Percentage(76)])
                 .split(chunks[1]);
 
             let sidebar_border = if app.focus == Focus::Sidebar { ACTIVE } else { MUTED };
@@ -159,7 +165,61 @@ async fn main() -> Result<()> {
             let sidebar = List::new(sidebar_items)
                 .block(Block::default().borders(Borders::ALL).title(" Tables ").border_style(Style::default().fg(sidebar_border)))
                 .highlight_style(Style::default().bg(SELECTED).fg(ACTIVE).add_modifier(Modifier::BOLD));
-            f.render_stateful_widget(sidebar, main_chunks[0], &mut app.sidebar_state);
+            let hierarchy_panes = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+                .split(main_chunks[0]);
+            f.render_stateful_widget(sidebar, hierarchy_panes[0], &mut app.sidebar_state);
+
+            let mut chain_items = vec![ListItem::new("ALL CHAINS")];
+            chain_items.extend(app.visible_chains.iter().filter_map(|index| {
+                let chain = app.chains.get(*index)?;
+                let rule_count = app.rules.iter().filter(|rule| {
+                    rule.family == chain.family && rule.table == chain.table && rule.chain == chain.name
+                }).count();
+                let mut lines = vec![Line::from(format!(
+                    "{} · {} rule{}",
+                    chain.name,
+                    rule_count,
+                    if rule_count == 1 { "" } else { "s" }
+                ))];
+                if chain.hook.is_empty() {
+                    lines.push(Line::styled(
+                        format!(
+                            "  {}",
+                            if chain.chain_type.is_empty() {
+                                "regular chain"
+                            } else {
+                                &chain.chain_type
+                            }
+                        ),
+                        Style::default().fg(MUTED),
+                    ));
+                } else {
+                    lines.push(Line::styled(
+                        format!(
+                            "  type {} · hook {}",
+                            if chain.chain_type.is_empty() { "-" } else { &chain.chain_type },
+                            chain.hook,
+                        ),
+                        Style::default().fg(MUTED),
+                    ));
+                    lines.push(Line::styled(
+                        format!(
+                            "  priority {} · policy {}",
+                            if chain.priority.is_empty() { "-" } else { &chain.priority },
+                            if chain.policy.is_empty() { "-" } else { &chain.policy },
+                        ),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+                Some(ListItem::new(lines))
+            }));
+            let chain_border = if app.focus == Focus::Chains { ACTIVE } else { MUTED };
+            let chain_list = List::new(chain_items)
+                .block(Block::default().borders(Borders::ALL).title(" Chains ").border_style(Style::default().fg(chain_border)))
+                .highlight_style(Style::default().bg(SELECTED).fg(ACTIVE).add_modifier(Modifier::BOLD));
+            f.render_stateful_widget(chain_list, hierarchy_panes[1], &mut app.chain_state);
 
             let table_border = if app.focus == Focus::Table { ACTIVE } else { MUTED };
             let header = Row::new(vec!["Hndl", "Chain", "Source / Iface", "Dest / Iface", "Proto / Match", "Action", "Counters"])
@@ -196,12 +256,16 @@ async fn main() -> Result<()> {
             .highlight_symbol("▶ ");
 
             if app.visible.is_empty() {
-                let msg = if app.rules.is_empty() {
-                    "No firewall rules were found. Press a to create the first rule.".to_string()
-                } else if !app.filter.value.trim().is_empty() {
+                let msg = if !app.filter.value.trim().is_empty() {
                     format!("No rules match \"{}\". Press Esc in Filter to clear it.", app.filter.value)
+                } else if let Some(chain) = app.selected_firewall_chain() {
+                    format!("Chain {} exists and has 0 rules. Press a to add its first rule.", chain.name)
+                } else if let Some(table) = app.selected_firewall_table() {
+                    format!("Table {}/{} has no rules in the selected chain scope. Select a chain before adding a rule.", table.family, table.name)
+                } else if app.rules.is_empty() {
+                    "The ruleset has no rules. Tables and chains remain available in the hierarchy.".to_string()
                 } else {
-                    "This table has no rules. Choose ALL or press a to add one.".to_string()
+                    "No rules exist in the selected hierarchy scope.".to_string()
                 };
                 f.render_widget(Paragraph::new(msg).alignment(Alignment::Center).block(Block::default().borders(Borders::ALL).title(" Rules ").border_style(Style::default().fg(table_border))), main_chunks[1]);
             } else {
@@ -578,7 +642,8 @@ async fn main() -> Result<()> {
                         KeyCode::Char('q') => break,
                         KeyCode::Tab => {
                             app.focus = match app.focus {
-                                Focus::Sidebar => Focus::Table,
+                                Focus::Sidebar => Focus::Chains,
+                                Focus::Chains => Focus::Table,
                                 Focus::Table => Focus::Sidebar,
                             };
                         }
@@ -588,7 +653,7 @@ async fn main() -> Result<()> {
                         KeyCode::Char('g') => app.pending_g = true,
                         KeyCode::Char('G') => app.go_last(),
                         KeyCode::Char('a') => {
-                            app.form = RuleForm::new();
+                            app.form = app.new_rule_form_for_selection();
                             app.pending_operation = RuleOperation::Add;
                             app.mode = Mode::Add;
                         }
@@ -625,9 +690,9 @@ async fn main() -> Result<()> {
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('s') => app.mode = Mode::Sort,
                         KeyCode::Char('S') => { app.sort_reverse = !app.sort_reverse; app.recompute_visible(); },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · j/k navigates · gg/G jumps first/last · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · j/k navigates · gg/G jumps first/last · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
                         KeyCode::Char('r') => match fetch_ruleset().await {
-                            Ok(r) => { app.rules = r; app.update_sidebar(); app.recompute_visible(); app.status_msg = "Refreshed".to_string(); }
+                            Ok(snapshot) => { app.apply_firewall_snapshot(snapshot); app.status_msg = "Refreshed".to_string(); }
                             Err(e) => app.status_msg = format!("Refresh failed: {}", e),
                         },
                         KeyCode::Char('n') => match network::load_profiles().await {
@@ -652,7 +717,7 @@ async fn main() -> Result<()> {
                             if app.pending_operation.needs_handle() { if let Some(rule) = app.selected_rule() { args.extend(["handle".into(), rule.handle.to_string()]); } }
                             args.push(statement);
                             match Command::new("nft").args(&args).output().await { Ok(out) if out.status.success() => { app.status_msg = "Structured rule applied successfully".into(); app.mode = Mode::Normal; }, Ok(out) => { app.error_msg = String::from_utf8_lossy(&out.stderr).into_owned(); app.mode = Mode::Error; }, Err(e) => { app.error_msg = format!("Failed to run nft: {}", e); app.mode = Mode::Error; } }
-                            if let Ok(r) = fetch_ruleset().await { app.rules = r; app.update_sidebar(); app.recompute_visible(); }
+                            if let Ok(snapshot) = fetch_ruleset().await { app.apply_firewall_snapshot(snapshot); }
                         }
                         _ => {}
                     },
@@ -742,10 +807,8 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            if let Ok(r) = fetch_ruleset().await {
-                                app.rules = r;
-                                app.update_sidebar();
-                                app.recompute_visible();
+                            if let Ok(snapshot) = fetch_ruleset().await {
+                                app.apply_firewall_snapshot(snapshot);
                             }
                         }
                         KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Normal,
@@ -787,10 +850,8 @@ async fn main() -> Result<()> {
                     Mode::FatalError => match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('r') => match fetch_ruleset().await {
-                            Ok(r) => {
-                                app.rules = r;
-                                app.update_sidebar();
-                                app.recompute_visible();
+                            Ok(snapshot) => {
+                                app.apply_firewall_snapshot(snapshot);
                                 app.status_msg = "Ready".to_string();
                                 app.mode = Mode::Normal;
                             }
@@ -804,10 +865,8 @@ async fn main() -> Result<()> {
             _ = refresh_interval.tick() => {
                 if app.mode == Mode::Normal {
                     match app.section {
-                        Section::Firewall => if let Ok(r) = fetch_ruleset().await {
-                            app.rules = r;
-                            app.update_sidebar();
-                            app.recompute_visible();
+                        Section::Firewall => if let Ok(snapshot) = fetch_ruleset().await {
+                            app.apply_firewall_snapshot(snapshot);
                         },
                         Section::Ports => if let Ok(entries) = sockets::client::load(app.socket_tab == SocketTab::Listening).await {
                             app.replace_sockets(entries);

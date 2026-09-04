@@ -28,6 +28,8 @@ Use `F1`, `F2`, and `F3` to switch workspaces. In list views, `j`/`k` moves one 
 
 Press `/` in Firewall, Network, or Ports to open a visible live filter. In Firewall, `s` chooses a sort field and `Shift+S` reverses the current sort direction. Press `e` to edit the selected rule; complex NAT, set, and range rules open directly in Advanced mode.
 
+The Firewall workspace reads tables, chains, and rules as separate nftables objects. Empty tables and chains remain visible in the hierarchy, and chain entries show their rule count plus available type, hook, priority, and policy metadata.
+
 Network edits change persistent NetworkManager profiles. AEGIS deliberately does not reactivate a connection automatically, because doing so can interrupt remote access.
 
 ## Development
