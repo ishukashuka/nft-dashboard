@@ -61,6 +61,83 @@ async fn open_firewall(app: &mut App) {
     }
 }
 
+fn prepare_rule_review(app: &mut App) {
+    if app.form.advanced {
+        let statement = app.form.statement.value.trim().to_string();
+        if app.form.family.value.trim().is_empty()
+            || app.form.table.value.trim().is_empty()
+            || app.form.chain.value.trim().is_empty()
+        {
+            app.status_msg = "Family, table, and chain are required".into();
+        } else if statement.is_empty() {
+            app.status_msg = "Rule expression cannot be empty".into();
+        } else {
+            app.pending_statement = statement;
+            app.mode = Mode::RuleReview;
+        }
+        return;
+    }
+
+    app.form.family = TextField::from(app.form.structured[0].value.trim());
+    app.form.table = TextField::from(app.form.structured[1].value.trim());
+    app.form.chain = TextField::from(app.form.structured[2].value.trim());
+    let draft = app.form.structured_draft();
+    if app.form.family.value.is_empty()
+        || app.form.table.value.is_empty()
+        || app.form.chain.value.is_empty()
+    {
+        app.status_msg = "Family, table, and chain are required".into();
+    } else if let Some(error) = draft.validation_error(&app.form.family.value) {
+        app.status_msg = error;
+    } else {
+        app.pending_statement = draft.generated_for_family(&app.form.family.value);
+        app.mode = Mode::RuleReview;
+    }
+}
+
+async fn run_shell_command(command: &str) -> String {
+    let Some(command) = command.trim().strip_prefix('!').map(str::trim) else {
+        return "Only shell commands are supported here. Use :!command".into();
+    };
+    if command.is_empty() {
+        return "No shell command was provided. Use :!command".into();
+    }
+    let execution = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .kill_on_drop(true)
+        .output();
+    match time::timeout(Duration::from_secs(30), execution).await {
+        Ok(Ok(output)) => {
+            let status = output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into());
+            let sanitize = |bytes: &[u8]| {
+                String::from_utf8_lossy(bytes)
+                    .chars()
+                    .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+                    .collect::<String>()
+            };
+            let stdout = sanitize(&output.stdout);
+            let stderr = sanitize(&output.stderr);
+            let body = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+                (true, true) => "(no output)".to_string(),
+                (false, true) => stdout,
+                (true, false) => stderr,
+                (false, false) => format!("{}\n\nSTDERR\n{}", stdout, stderr),
+            };
+            truncate_str(
+                &format!("$ {}\nexit {}\n\n{}", command, status, body),
+                65_536,
+            )
+        }
+        Ok(Err(error)) => format!("Failed to start /bin/sh: {}", error),
+        Err(_) => format!("$ {}\n\nTerminated after the 30 second timeout.", command),
+    }
+}
+
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -120,12 +197,16 @@ async fn main() -> Result<()> {
                 if matches!(app.mode, Mode::NetworkEdit | Mode::NetworkConfirm) { draw_network_modal(f, &app); }
                 if app.mode == Mode::Error { draw_error_modal(f, &app); }
                 if app.mode == Mode::Help { draw_help_modal(f, &app); }
+                if app.mode == Mode::Command { draw_command_bar(f, &app); }
+                if app.mode == Mode::CommandOutput { draw_command_output(f, &app); }
                 return;
             }
             if app.section == Section::Ports {
                 draw_ports(f, &app);
                 if app.mode == Mode::Error { draw_error_modal(f, &app); }
                 if app.mode == Mode::Help { draw_help_modal(f, &app); }
+                if app.mode == Mode::Command { draw_command_bar(f, &app); }
+                if app.mode == Mode::CommandOutput { draw_command_output(f, &app); }
                 return;
             }
 
@@ -273,7 +354,7 @@ async fn main() -> Result<()> {
             }
 
             let footer_text = match app.mode {
-                Mode::Normal => " j/k Move  gg/G First/Last  Enter Inspect  a Add  e Edit  x Del  ? Keys ",
+                Mode::Normal => " j/k Move  gg/G First/Last  Enter Inspect  a Add  e Edit  x Del  : Command  ? Keys ",
                 Mode::Add | Mode::Insert | Mode::Edit => " Tab Field  j/k Select  Space Toggle  F4 Advanced  Enter Review  Esc Cancel ",
                 Mode::ConfirmDelete => " [y] Confirm Delete | [n/Esc] Cancel ",
                 Mode::Filter => " Filter: ",
@@ -285,6 +366,8 @@ async fn main() -> Result<()> {
                 Mode::NetworkConfirm => " [y] Apply | [n/Esc] Cancel ",
                 Mode::RuleReview => " [Enter] Apply | [Esc] Back ",
                 Mode::Sort => " [j/k] Choose sort | [Enter] Apply | [Esc] Cancel ",
+                Mode::Command => " :!command  Enter Run  Esc Cancel ",
+                Mode::CommandOutput => " j/k Scroll  Esc/Enter Close ",
             };
 
             let footer_layout = Layout::default()
@@ -324,6 +407,7 @@ async fn main() -> Result<()> {
                         _ if app.form.unsupported => " Edit Rule · Advanced nft syntax ",
                         _ => " Edit/Replace Rule ",
                     };
+                    let title = format!("{} [{}] ", title.trim_end(), app.form.vim_mode.label());
 
                     let modal_block = Block::default()
                         .title(title)
@@ -333,13 +417,19 @@ async fn main() -> Result<()> {
                     f.render_widget(modal_block, area);
 
                     if !app.form.advanced {
-                        let labels = ["Family", "Table", "Chain", "Protocol", "Source address", "Destination address", "Input interface", "Output interface", "Source port", "Destination port", "CT state", "Verdict", "Target chain", "Comment", "Counter", "Log"];
+                        let labels = ["Family", "Table", "Chain", "Protocol", "Source address", "Destination address", "Input interface", "Output interface", "Source port (80,443 or 8000-8010)", "Destination port (80,443 or 8000-8010)", "CT state", "Verdict", "Target chain", "Comment", "Counter", "Log"];
                         let start = app.form.field_idx.saturating_sub(3);
                         let end = (start + 7).min(labels.len());
                         let visible = Layout::default().direction(Direction::Vertical).margin(2).constraints(vec![Constraint::Length(3); end - start]).split(area);
                         for (row, idx) in (start..end).enumerate() {
                             let value = if idx < 14 { app.form.structured[idx].value.clone() } else if idx == 14 { if app.form.counter { "ON".into() } else { "OFF".into() } } else if app.form.log { "ON".into() } else { "OFF".into() };
-                            f.render_widget(Paragraph::new(value).block(Block::default().borders(Borders::ALL).title(format!(" {} {} ", labels[idx], if idx == 3 || idx == 11 { "(j/k select)" } else { "" })).border_style(Style::default().fg(if idx == app.form.field_idx { ACTIVE } else { MUTED }))), visible[row]);
+                            let line = vim_field_line(&value, app.form.visual_range(idx));
+                            let scroll = if idx < 14 {
+                                horizontal_field_scroll(&app.form.structured[idx], visible[row].width)
+                            } else {
+                                0
+                            };
+                            f.render_widget(Paragraph::new(line).scroll((0, scroll)).block(Block::default().borders(Borders::ALL).title(format!(" {} {} ", labels[idx], if idx == 3 || idx == 11 { "(h/l select)" } else { "" })).border_style(Style::default().fg(if idx == app.form.field_idx { ACTIVE } else { MUTED }))), visible[row]);
                         }
                         if app.form.field_idx < 14
                             && app.form.field_idx != 3
@@ -348,14 +438,22 @@ async fn main() -> Result<()> {
                         {
                             let active = visible[app.form.field_idx - start];
                             let field = &app.form.structured[app.form.field_idx];
+                            let scroll = horizontal_field_scroll(field, active.width);
                             let max_x = active.x + active.width.saturating_sub(2);
                             f.set_cursor(
-                                (active.x + 1 + field.cursor as u16).min(max_x),
+                                (active.x + 1 + field.cursor as u16)
+                                    .saturating_sub(scroll)
+                                    .min(max_x),
                                 active.y + 1,
                             );
                         }
                         let generated = app.form.structured_draft().generated_for_family(&app.form.structured[0].value);
-                        f.render_widget(Paragraph::new(format!("Mode: STRUCTURED\n[F4] Advanced   [Space] Toggle   Generated: {}", generated)).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL).title(" Preview ")), area.inner(&ratatui::layout::Margin { vertical: area.height.saturating_sub(5), horizontal: 2 }));
+                        let vim_help = match app.form.vim_mode {
+                            VimMode::Normal => "NORMAL  j/k fields · h/l move/select · i insert · v visual · Enter review",
+                            VimMode::Insert => "INSERT  type to edit · Up/Down fields · Esc normal · Ctrl-S review",
+                            VimMode::Visual => "VISUAL  h/l or w/b select · d delete · c change · Esc normal",
+                        };
+                        f.render_widget(Paragraph::new(format!("{}\n[F4] Advanced · [Space] Toggle · Generated: {}", vim_help, generated)).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL).title(" Preview ")), area.inner(&ratatui::layout::Margin { vertical: area.height.saturating_sub(5), horizontal: 2 }));
                     } else {
                     let inner_layout = Layout::default()
                         .direction(Direction::Vertical)
@@ -385,7 +483,7 @@ async fn main() -> Result<()> {
                             .border_style(Style::default().fg(border_color));
                         let scroll = horizontal_field_scroll(field, inner_layout[idx].width);
                         f.render_widget(
-                            Paragraph::new(field.value.as_str())
+                            Paragraph::new(vim_field_line(field.value.as_str(), app.form.visual_range(idx)))
                                 .scroll((0, scroll))
                                 .block(field_block),
                             inner_layout[idx],
@@ -393,7 +491,11 @@ async fn main() -> Result<()> {
                     }
 
                     f.render_widget(
-                        Paragraph::new("[Enter] Review change   [Esc] Cancel   Edit the expression using nft syntax")
+                        Paragraph::new(match app.form.vim_mode {
+                            VimMode::Normal => "NORMAL · i insert · v visual · h/l or w/b move · Enter review · Esc cancel",
+                            VimMode::Insert => "INSERT · type to edit · Esc normal · Ctrl-S review",
+                            VimMode::Visual => "VISUAL · h/l or w/b select · d delete · c change · Esc normal",
+                        })
                             .style(Style::default().fg(MUTED).bg(MODAL))
                             .alignment(Alignment::Center),
                         inner_layout[4],
@@ -471,6 +573,8 @@ async fn main() -> Result<()> {
                     let text = keys.iter().enumerate().map(|(i, k)| format!("{}{}", if i == app.sort_index { "> " } else { "  " }, k.title())).collect::<Vec<_>>().join("\n");
                     f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Sort rules ").border_style(Style::default().fg(ACTIVE))), area);
                 }
+                Mode::Command => draw_command_bar(f, &app),
+                Mode::CommandOutput => draw_command_output(f, &app),
                 _ => {}
             }
         })?;
@@ -481,7 +585,44 @@ async fn main() -> Result<()> {
                 if key.code != KeyCode::Char('g') {
                     app.pending_g = false;
                 }
-                let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort);
+                if app.mode == Mode::Command {
+                    match key.code {
+                        KeyCode::Esc => app.mode = app.command_return_mode,
+                        KeyCode::Enter => {
+                            app.command_output = run_shell_command(&app.command.value).await;
+                            app.detail_scroll = 0;
+                            app.mode = Mode::CommandOutput;
+                        }
+                        KeyCode::Left => app.command.left(),
+                        KeyCode::Right => app.command.right(),
+                        KeyCode::Home => app.command.home(),
+                        KeyCode::End => app.command.end(),
+                        KeyCode::Backspace => app.command.backspace(),
+                        KeyCode::Delete => app.command.delete(),
+                        KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => app.command.insert(character),
+                        _ => {}
+                    }
+                    continue;
+                }
+                if app.mode == Mode::CommandOutput {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => app.mode = app.command_return_mode,
+                        KeyCode::Char('j') | KeyCode::Down => app.detail_scroll = app.detail_scroll.saturating_add(1),
+                        KeyCode::Char('k') | KeyCode::Up => app.detail_scroll = app.detail_scroll.saturating_sub(1),
+                        _ => {}
+                    }
+                    continue;
+                }
+                let command_available = app.mode == Mode::Normal
+                    || (matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit)
+                        && app.form.vim_mode == VimMode::Normal);
+                if command_available && key.code == KeyCode::Char(':') {
+                    app.command_return_mode = app.mode;
+                    app.command.clear();
+                    app.mode = Mode::Command;
+                    continue;
+                }
+                let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort | Mode::Command | Mode::CommandOutput);
                 if key.code == KeyCode::F(1) && !section_switch_owned {
                     open_firewall(&mut app).await;
                     continue;
@@ -524,7 +665,7 @@ async fn main() -> Result<()> {
                         KeyCode::Enter => if app.selected_socket().is_some() { app.socket_inspector_tab = SocketInspectorTab::Details; app.detail_scroll = 0; app.mode = Mode::Detail; },
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('r') => match sockets::client::load(app.socket_tab == SocketTab::Listening).await { Ok(entries) => { app.replace_sockets(entries); app.status_msg = "Ports refreshed".into(); }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } },
-                        KeyCode::Char('?') => { app.error_msg = "F1 Firewall · F2 Network · F3 Ports\nh/l switches Listening and Connections · j/k selects · gg/G jumps first/last · Enter inspects · / filters · r refreshes · Esc goes back · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "F1 Firewall · F2 Network · F3 Ports\nh/l switches Listening and Connections · j/k selects · gg/G jumps first/last · Enter inspects · / filters · :!command runs a shell command · r refreshes · Esc goes back · q quits".into(); app.mode = Mode::Help; },
                         _ => {}
                     }
                     continue;
@@ -632,7 +773,7 @@ async fn main() -> Result<()> {
                         KeyCode::Char('e') => if let Some(p) = app.selected_network_profile() { app.network_form = Some(match app.network_tab { NetworkTab::General => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.autoconnect)], title: "General configuration".into() }, NetworkTab::Ipv4 => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.ipv4_method), TextField::from(&p.addresses.join(", ")), TextField::from(&p.gateway), TextField::from(&p.metric)], title: "IPv4 configuration".into() }, NetworkTab::Dns => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.dns.join(", ")), TextField::from(&p.search.join(", "))], title: "DNS configuration".into() }, NetworkTab::Routes => if let Some(route) = p.routes.get(app.network_route_selected) { NetworkForm { field_idx: 0, fields: vec![TextField::from(&route.destination), TextField::from(&route.gateway), TextField::from(&route.metric)], title: "Edit persistent route".into() } } else { NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() } } }); app.network_action = if app.network_tab == NetworkTab::Routes { "edit persistent route".into() } else { "Review the persistent change".into() }; app.mode = Mode::NetworkEdit; },
                         KeyCode::Char('a') if app.network_tab == NetworkTab::Routes => if app.selected_network_profile().is_some() { app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() }); app.network_action = "Review adding this persistent route".into(); app.mode = Mode::NetworkEdit; },
                         KeyCode::Char('d') if app.network_tab == NetworkTab::Routes => if let Some(p) = app.selected_network_profile() { if let Some(route) = p.routes.get(app.network_route_selected) { app.network_action = format!("delete route {} via {}", route.destination, route.gateway); app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default()], title: "Delete persistent route".into() }); app.mode = Mode::NetworkConfirm; } },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · h/l switches tabs · j/k selects profiles or routes · gg/G jumps first/last · / filters profiles · e edits autoconnect, IPv4, DNS, or routes · a adds a route · d removes a route · r refreshes · f returns to Firewall · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · h/l switches tabs · j/k selects profiles or routes · gg/G jumps first/last · / filters profiles · :!command runs a shell command · e edits autoconnect, IPv4, DNS, or routes · a adds a route · d removes a route · r refreshes · f returns to Firewall · q quits".into(); app.mode = Mode::Help; },
                         _ => {}
                     }
                     continue;
@@ -690,7 +831,7 @@ async fn main() -> Result<()> {
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('s') => app.mode = Mode::Sort,
                         KeyCode::Char('S') => { app.sort_reverse = !app.sort_reverse; app.recompute_visible(); },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · j/k navigates · gg/G jumps first/last · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · j/k navigates · gg/G jumps first/last · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · :!command runs a shell command · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
                         KeyCode::Char('r') => match fetch_ruleset().await {
                             Ok(snapshot) => { app.apply_firewall_snapshot(snapshot); app.status_msg = "Refreshed".to_string(); }
                             Err(e) => app.status_msg = format!("Refresh failed: {}", e),
@@ -728,61 +869,86 @@ async fn main() -> Result<()> {
                         KeyCode::Enter => { app.sort_key = [firewall::SortKey::ChainOrder, firewall::SortKey::Handle, firewall::SortKey::Protocol, firewall::SortKey::Source, firewall::SortKey::Destination, firewall::SortKey::Action, firewall::SortKey::Packets, firewall::SortKey::Bytes][app.sort_index]; app.recompute_visible(); app.mode = Mode::Normal; },
                         _ => {}
                     },
-                    Mode::Add | Mode::Insert | Mode::Edit => match key.code {
-                        KeyCode::Esc => app.mode = Mode::Normal,
-                        KeyCode::Tab => app.form.next_field(),
-                        KeyCode::BackTab => app.form.prev_field(),
-                        KeyCode::F(4) if !app.form.advanced => { app.form.advanced = true; app.form.field_idx = 3; },
-                        KeyCode::F(4) if app.form.advanced && !app.form.unsupported => { app.form.advanced = false; app.form.field_idx = 0; },
-                        KeyCode::Char('j') | KeyCode::Down if !app.form.advanced && (app.form.field_idx == 3 || app.form.field_idx == 11) => app.form.cycle_selector(1),
-                        KeyCode::Char('k') | KeyCode::Up if !app.form.advanced && (app.form.field_idx == 3 || app.form.field_idx == 11) => app.form.cycle_selector(-1),
-                        KeyCode::Char(' ') if !app.form.advanced && (app.form.field_idx == 14 || app.form.field_idx == 15) => app.form.toggle_bool(),
-                        KeyCode::Left if !app.form.advanced && app.form.field_idx < 14 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().left(),
-                        KeyCode::Right if !app.form.advanced && app.form.field_idx < 14 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().right(),
-                        KeyCode::Home if !app.form.advanced && app.form.field_idx < 14 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().home(),
-                        KeyCode::End if !app.form.advanced && app.form.field_idx < 14 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().end(),
-                        KeyCode::Backspace if !app.form.advanced && app.form.field_idx < 14 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().backspace(),
-                        KeyCode::Delete if !app.form.advanced && app.form.field_idx < 14 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().delete(),
-                        KeyCode::Char(c) if !app.form.advanced && app.form.field_idx < 14 && app.form.field_idx != 3 && app.form.field_idx != 11 && (!app.form.location_locked || app.form.field_idx > 2) => app.form.structured_field_mut().insert(c),
-                        KeyCode::Enter if !app.form.advanced => {
-                            app.form.family = TextField::from(app.form.structured[0].value.trim());
-                            app.form.table = TextField::from(app.form.structured[1].value.trim());
-                            app.form.chain = TextField::from(app.form.structured[2].value.trim());
-                            let draft = app.form.structured_draft();
-                            let location_missing = app.form.family.value.is_empty()
-                                || app.form.table.value.is_empty()
-                                || app.form.chain.value.is_empty();
-                            if location_missing {
-                                app.status_msg = "Family, table, and chain are required".into();
-                            } else if let Some(error) = draft.validation_error(&app.form.family.value) {
-                                app.status_msg = error;
-                            } else {
-                                app.pending_statement = draft.generated_for_family(&app.form.family.value);
-                                app.mode = Mode::RuleReview;
-                            }
-                        },
-                        KeyCode::Enter if app.form.advanced => {
-                            let statement = app.form.statement.value.trim().to_string();
-                            if app.form.family.value.trim().is_empty()
-                                || app.form.table.value.trim().is_empty()
-                                || app.form.chain.value.trim().is_empty()
-                            {
-                                app.status_msg = "Family, table, and chain are required".into();
-                            } else if statement.is_empty() {
-                                app.status_msg = "Rule expression cannot be empty".to_string();
-                            } else {
-                                app.pending_statement = statement;
-                                app.mode = Mode::RuleReview;
-                            }
+                    Mode::Add | Mode::Insert | Mode::Edit => {
+                        let review_shortcut = key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('s');
+                        if review_shortcut
+                            || (app.form.vim_mode == VimMode::Normal
+                                && key.code == KeyCode::Enter)
+                        {
+                            prepare_rule_review(&mut app);
+                            continue;
                         }
-                        KeyCode::Left if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().left(),
-                        KeyCode::Right if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().right(),
-                        KeyCode::Home if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().home(),
-                        KeyCode::End if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().end(),
-                        KeyCode::Delete if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().delete(),
-                        KeyCode::Backspace if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().backspace(),
-                        KeyCode::Char(c) if app.form.advanced && (!app.form.location_locked || app.form.field_idx == 3) => app.form.active_field_mut().insert(c),
-                        _ => {}
+                        match key.code {
+                            KeyCode::Tab => { app.form.next_field(); continue; }
+                            KeyCode::BackTab => { app.form.prev_field(); continue; }
+                            KeyCode::F(4) if !app.form.advanced => {
+                                app.form.leave_visual();
+                                app.form.vim_mode = VimMode::Normal;
+                                app.form.advanced = true;
+                                app.form.field_idx = 3;
+                                continue;
+                            }
+                            KeyCode::F(4) if app.form.advanced && !app.form.unsupported => {
+                                app.form.leave_visual();
+                                app.form.vim_mode = VimMode::Normal;
+                                app.form.advanced = false;
+                                app.form.field_idx = 0;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        match app.form.vim_mode {
+                            VimMode::Normal => match key.code {
+                                KeyCode::Esc => app.mode = Mode::Normal,
+                                KeyCode::Char('j') | KeyCode::Down => app.form.next_field(),
+                                KeyCode::Char('k') | KeyCode::Up => app.form.prev_field(),
+                                KeyCode::Char('g') if app.pending_g => { app.form.first_field(); app.pending_g = false; },
+                                KeyCode::Char('g') => app.pending_g = true,
+                                KeyCode::Char('G') => app.form.last_field(),
+                                KeyCode::Char('h') | KeyCode::Left if !app.form.advanced && matches!(app.form.field_idx, 3 | 11) => app.form.cycle_selector(-1),
+                                KeyCode::Char('l') | KeyCode::Right if !app.form.advanced && matches!(app.form.field_idx, 3 | 11) => app.form.cycle_selector(1),
+                                KeyCode::Char(' ') if !app.form.advanced && matches!(app.form.field_idx, 14 | 15) => app.form.toggle_bool(),
+                                KeyCode::Char('h') | KeyCode::Left => if let Some(field) = app.form.active_text_field_mut() { field.left(); },
+                                KeyCode::Char('l') | KeyCode::Right => if let Some(field) = app.form.active_text_field_mut() { field.right(); },
+                                KeyCode::Char('w') => if let Some(field) = app.form.active_text_field_mut() { field.word_forward(); },
+                                KeyCode::Char('b') => if let Some(field) = app.form.active_text_field_mut() { field.word_backward(); },
+                                KeyCode::Char('0') | KeyCode::Home => if let Some(field) = app.form.active_text_field_mut() { field.home(); },
+                                KeyCode::Char('$') | KeyCode::End => if let Some(field) = app.form.active_text_field_mut() { field.end(); },
+                                KeyCode::Char('i') => app.form.enter_insert(),
+                                KeyCode::Char('I') => { if let Some(field) = app.form.active_text_field_mut() { field.home(); } app.form.enter_insert(); },
+                                KeyCode::Char('a') => { if let Some(field) = app.form.active_text_field_mut() { field.right(); } app.form.enter_insert(); },
+                                KeyCode::Char('A') => { if let Some(field) = app.form.active_text_field_mut() { field.end(); } app.form.enter_insert(); },
+                                KeyCode::Char('v') => app.form.enter_visual(),
+                                KeyCode::Char('x') | KeyCode::Delete => if let Some(field) = app.form.active_text_field_mut() { field.delete(); },
+                                _ => {}
+                            },
+                            VimMode::Insert => match key.code {
+                                KeyCode::Esc => app.form.vim_mode = VimMode::Normal,
+                                KeyCode::Up => app.form.prev_field(),
+                                KeyCode::Down | KeyCode::Enter => app.form.next_field(),
+                                KeyCode::Left => if let Some(field) = app.form.active_text_field_mut() { field.left(); },
+                                KeyCode::Right => if let Some(field) = app.form.active_text_field_mut() { field.right(); },
+                                KeyCode::Home => if let Some(field) = app.form.active_text_field_mut() { field.home(); },
+                                KeyCode::End => if let Some(field) = app.form.active_text_field_mut() { field.end(); },
+                                KeyCode::Backspace => if let Some(field) = app.form.active_text_field_mut() { field.backspace(); },
+                                KeyCode::Delete => if let Some(field) = app.form.active_text_field_mut() { field.delete(); },
+                                KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => if let Some(field) = app.form.active_text_field_mut() { field.insert(c); },
+                                _ => {}
+                            },
+                            VimMode::Visual => match key.code {
+                                KeyCode::Esc => app.form.leave_visual(),
+                                KeyCode::Char('h') | KeyCode::Left => if let Some(field) = app.form.active_text_field_mut() { field.left(); },
+                                KeyCode::Char('l') | KeyCode::Right => if let Some(field) = app.form.active_text_field_mut() { field.right(); },
+                                KeyCode::Char('w') => if let Some(field) = app.form.active_text_field_mut() { field.word_forward(); },
+                                KeyCode::Char('b') => if let Some(field) = app.form.active_text_field_mut() { field.word_backward(); },
+                                KeyCode::Char('0') | KeyCode::Home => if let Some(field) = app.form.active_text_field_mut() { field.home(); },
+                                KeyCode::Char('$') | KeyCode::End => if let Some(field) = app.form.active_text_field_mut() { field.end(); },
+                                KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => app.form.delete_visual_selection(false),
+                                KeyCode::Char('c') => app.form.delete_visual_selection(true),
+                                _ => {}
+                            },
+                        }
                     },
                     Mode::ConfirmDelete => match key.code {
                         KeyCode::Char('y') => {
@@ -859,7 +1025,7 @@ async fn main() -> Result<()> {
                         },
                         _ => {}
                     },
-                    Mode::NetworkEdit | Mode::NetworkConfirm => {}
+                    Mode::NetworkEdit | Mode::NetworkConfirm | Mode::Command | Mode::CommandOutput => {}
                 }
             }
             _ = refresh_interval.tick() => {
@@ -884,4 +1050,19 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
     std::mem::forget(terminal_guard);
     Ok(())
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_command_requires_bang_and_captures_output() {
+        assert!(run_shell_command("echo hidden")
+            .await
+            .contains("Only shell commands"));
+        let output = run_shell_command("!printf aegis-shell").await;
+        assert!(output.contains("exit 0"));
+        assert!(output.contains("aegis-shell"));
+    }
 }

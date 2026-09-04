@@ -30,6 +30,8 @@ Press `/` in Firewall, Network, or Ports to open a visible live filter. In Firew
 
 The Firewall workspace reads tables, chains, and rules as separate nftables objects. Empty tables and chains remain visible in the hierarchy, and chain entries show their rule count plus available type, hook, priority, and policy metadata.
 
+Rule forms use modal Vim controls: Normal mode navigates fields with `j`/`k`, Insert mode edits text after `i`, and Visual mode selects text after `v`. Use `Esc` to return to Normal and `Enter` in Normal to review. From any main workspace, `:!command` runs a non-interactive shell command with AEGIS's current privileges and displays its captured output; commands are terminated after 30 seconds.
+
 Network edits change persistent NetworkManager profiles. AEGIS deliberately does not reactivate a connection automatically, because doing so can interrupt remote access.
 
 ## Development

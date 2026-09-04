@@ -205,7 +205,7 @@ pub(crate) fn draw_ports(f: &mut ratatui::Frame, app: &App) {
     } else if app.mode == Mode::Detail {
         " h/l Tab  j/k Scroll  Esc Back  ? Keys ".into()
     } else {
-        " h/l Tab  j/k Move  gg/G First/Last  Enter Inspect  / Filter  r Refresh  ? Keys  q Quit "
+        " h/l Tab  j/k Move  gg/G First/Last  Enter Inspect  / Filter  : Command  r Refresh  ? Keys  q Quit "
             .into()
     };
     let footer_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
@@ -489,7 +489,7 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
             " Filter: {}  [Enter] Keep  [Esc] Clear ",
             app.network_filter.value
         ),
-        _ => " Tab Pane  h/l Tab  j/k Move  gg/G First/Last  / Filter  e Edit  a Add  d Del  ? Keys  q Quit ".into(),
+        _ => " Tab Pane  h/l Tab  j/k Move  gg/G First/Last  / Filter  : Command  e Edit  a Add  d Del  ? Keys  q Quit ".into(),
     };
     let footer_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
     f.render_widget(
@@ -630,6 +630,29 @@ pub(crate) fn horizontal_field_scroll(field: &TextField, width: u16) -> u16 {
     field.cursor.saturating_sub(visible_width) as u16
 }
 
+pub(crate) fn vim_field_line(value: &str, selection: Option<(usize, usize)>) -> Line<'static> {
+    let Some((start, end)) = selection else {
+        return Line::from(value.to_string());
+    };
+    let byte_at = |character_index: usize| {
+        value
+            .char_indices()
+            .nth(character_index)
+            .map(|(byte_index, _)| byte_index)
+            .unwrap_or(value.len())
+    };
+    let start = byte_at(start);
+    let end = byte_at(end);
+    Line::from(vec![
+        Span::raw(value[..start].to_string()),
+        Span::styled(
+            value[start..end].to_string(),
+            Style::default().fg(CANVAS).bg(ACTIVE),
+        ),
+        Span::raw(value[end..].to_string()),
+    ])
+}
+
 pub(crate) fn draw_error_modal(f: &mut ratatui::Frame, app: &App) {
     let area = centered_fixed(96, 9, f.size());
     f.render_widget(Clear, area);
@@ -665,6 +688,55 @@ pub(crate) fn draw_help_modal(f: &mut ratatui::Frame, app: &App) {
                 .style(Style::default().bg(MODAL))
                 .border_style(Style::default().fg(ACCENT)),
         ),
+        area,
+    );
+}
+
+pub(crate) fn draw_command_bar(f: &mut ratatui::Frame, app: &App) {
+    let screen = f.size();
+    let area = Rect::new(
+        screen.x + 1,
+        screen.bottom().saturating_sub(3),
+        screen.width.saturating_sub(2).max(1),
+        3.min(screen.height),
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Command · :! runs with AEGIS privileges ")
+        .style(Style::default().bg(MODAL))
+        .border_style(Style::default().fg(ACTIVE));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let scroll = horizontal_field_scroll(&app.command, inner.width.saturating_sub(1));
+    f.render_widget(
+        Paragraph::new(format!(":{}", app.command.value))
+            .scroll((0, scroll))
+            .style(Style::default().bg(MODAL)),
+        inner,
+    );
+    f.set_cursor(
+        (inner.x + 1 + app.command.cursor as u16)
+            .saturating_sub(scroll)
+            .min(inner.right().saturating_sub(1)),
+        inner.y,
+    );
+}
+
+pub(crate) fn draw_command_output(f: &mut ratatui::Frame, app: &App) {
+    let area = centered_rect(72, 70, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(app.command_output.as_str())
+            .scroll((app.detail_scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Shell output · j/k scroll · Esc/Enter close ")
+                    .style(Style::default().bg(MODAL))
+                    .border_style(Style::default().fg(ACCENT)),
+            ),
         area,
     );
 }

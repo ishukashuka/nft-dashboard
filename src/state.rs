@@ -66,6 +66,42 @@ impl TextField {
         self.value.clear();
         self.cursor = 0;
     }
+    pub(crate) fn word_forward(&mut self) {
+        let chars = self.value.chars().collect::<Vec<_>>();
+        while self.cursor < chars.len() && chars[self.cursor].is_alphanumeric() {
+            self.cursor += 1;
+        }
+        while self.cursor < chars.len() && !chars[self.cursor].is_alphanumeric() {
+            self.cursor += 1;
+        }
+    }
+    pub(crate) fn word_backward(&mut self) {
+        let chars = self.value.chars().collect::<Vec<_>>();
+        while self.cursor > 0 && !chars[self.cursor - 1].is_alphanumeric() {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && chars[self.cursor - 1].is_alphanumeric() {
+            self.cursor -= 1;
+        }
+    }
+    pub(crate) fn remove_chars(&mut self, start: usize, end: usize) {
+        let start_byte = self
+            .value
+            .char_indices()
+            .nth(start)
+            .map(|(index, _)| index)
+            .unwrap_or(self.value.len());
+        let end_byte = self
+            .value
+            .char_indices()
+            .nth(end)
+            .map(|(index, _)| index)
+            .unwrap_or(self.value.len());
+        if start_byte < end_byte {
+            self.value.replace_range(start_byte..end_byte, "");
+        }
+        self.cursor = start.min(self.value.chars().count());
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -117,7 +153,7 @@ impl NetworkTab {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Mode {
     Normal,
     Add,
@@ -133,6 +169,8 @@ pub(crate) enum Mode {
     NetworkConfirm,
     RuleReview,
     Sort,
+    Command,
+    CommandOutput,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -140,6 +178,23 @@ pub(crate) enum RuleOperation {
     Add,
     Insert,
     Replace,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum VimMode {
+    Normal,
+    Insert,
+    Visual,
+}
+
+impl VimMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Insert => "INSERT",
+            Self::Visual => "VISUAL",
+        }
+    }
 }
 
 impl RuleOperation {
@@ -176,6 +231,8 @@ pub(crate) struct RuleForm {
     pub(crate) log: bool,
     pub(crate) advanced: bool,
     pub(crate) unsupported: bool,
+    pub(crate) vim_mode: VimMode,
+    pub(crate) visual_anchor: Option<usize>,
 }
 
 pub(crate) struct NetworkForm {
@@ -215,6 +272,8 @@ impl RuleForm {
             log: false,
             advanced: false,
             unsupported: false,
+            vim_mode: VimMode::Normal,
+            visual_anchor: None,
         }
     }
     pub(crate) fn from_rule(rule: &Rule) -> Self {
@@ -254,6 +313,7 @@ impl RuleForm {
         form
     }
     pub(crate) fn next_field(&mut self) {
+        self.leave_visual();
         if self.advanced && self.location_locked {
             self.field_idx = 3;
             return;
@@ -262,6 +322,7 @@ impl RuleForm {
         self.field_idx = (self.field_idx + 1) % max;
     }
     pub(crate) fn prev_field(&mut self) {
+        self.leave_visual();
         if self.advanced && self.location_locked {
             self.field_idx = 3;
             return;
@@ -280,6 +341,103 @@ impl RuleForm {
             2 => &mut self.chain,
             _ => &mut self.statement,
         }
+    }
+
+    pub(crate) fn active_text_field_mut(&mut self) -> Option<&mut TextField> {
+        if self.advanced {
+            if self.location_locked && self.field_idx != 3 {
+                return None;
+            }
+            return Some(self.active_field_mut());
+        }
+        if self.field_idx >= 14
+            || matches!(self.field_idx, 3 | 11)
+            || (self.location_locked && self.field_idx <= 2)
+        {
+            return None;
+        }
+        Some(self.structured_field_mut())
+    }
+
+    pub(crate) fn enter_insert(&mut self) {
+        if self.active_text_field_mut().is_some() {
+            self.vim_mode = VimMode::Insert;
+            self.visual_anchor = None;
+        }
+    }
+
+    pub(crate) fn enter_visual(&mut self) {
+        let Some(field) = self.active_text_field_mut() else {
+            return;
+        };
+        let len = field.value.chars().count();
+        if len == 0 {
+            return;
+        }
+        if field.cursor == len {
+            field.cursor = len - 1;
+        }
+        self.visual_anchor = Some(field.cursor);
+        self.vim_mode = VimMode::Visual;
+    }
+
+    pub(crate) fn leave_visual(&mut self) {
+        if self.vim_mode == VimMode::Visual {
+            self.vim_mode = VimMode::Normal;
+        }
+        self.visual_anchor = None;
+    }
+
+    pub(crate) fn visual_range(&self, field_index: usize) -> Option<(usize, usize)> {
+        if self.vim_mode != VimMode::Visual || self.field_idx != field_index {
+            return None;
+        }
+        let anchor = self.visual_anchor?;
+        let field = if self.advanced {
+            match field_index {
+                0 => &self.family,
+                1 => &self.table,
+                2 => &self.chain,
+                _ => &self.statement,
+            }
+        } else {
+            self.structured.get(field_index)?
+        };
+        let len = field.value.chars().count();
+        if len == 0 {
+            return None;
+        }
+        let cursor = field.cursor.min(len - 1);
+        Some((anchor.min(cursor), (anchor.max(cursor) + 1).min(len)))
+    }
+
+    pub(crate) fn delete_visual_selection(&mut self, enter_insert: bool) {
+        let Some((start, end)) = self.visual_range(self.field_idx) else {
+            return;
+        };
+        if let Some(field) = self.active_text_field_mut() {
+            field.remove_chars(start, end);
+        }
+        self.visual_anchor = None;
+        self.vim_mode = if enter_insert {
+            VimMode::Insert
+        } else {
+            VimMode::Normal
+        };
+    }
+
+    pub(crate) fn first_field(&mut self) {
+        self.leave_visual();
+        self.field_idx = if self.advanced && self.location_locked {
+            3
+        } else {
+            0
+        };
+    }
+
+    pub(crate) fn last_field(&mut self) {
+        self.leave_visual();
+        self.field_idx = if self.advanced { 3 } else { 15 };
     }
 
     pub(crate) fn structured_field_mut(&mut self) -> &mut TextField {
@@ -351,6 +509,9 @@ pub(crate) struct App {
     pub(crate) network_filter: TextField,
     pub(crate) socket_filter: TextField,
     pub(crate) pending_g: bool,
+    pub(crate) command: TextField,
+    pub(crate) command_output: String,
+    pub(crate) command_return_mode: Mode,
     pub(crate) status_msg: String,
     pub(crate) error_msg: String,
     pub(crate) detail_scroll: u16,
@@ -426,6 +587,9 @@ impl App {
             network_filter: TextField::default(),
             socket_filter: TextField::default(),
             pending_g: false,
+            command: TextField::default(),
+            command_output: String::new(),
+            command_return_mode: Mode::Normal,
             status_msg: "Ready".to_string(),
             error_msg: String::new(),
             detail_scroll: 0,
@@ -1010,5 +1174,33 @@ mod tests {
         assert_eq!(app.sidebar_items, vec!["ALL", "inet/pintech"]);
         assert_eq!(app.visible_chains, vec![0]);
         assert!(app.visible.is_empty());
+    }
+
+    #[test]
+    fn rule_form_supports_modal_insert_and_upward_navigation() {
+        let mut form = RuleForm::new();
+        assert_eq!(form.vim_mode, VimMode::Normal);
+        form.field_idx = 5;
+        form.prev_field();
+        assert_eq!(form.field_idx, 4);
+        form.enter_insert();
+        assert_eq!(form.vim_mode, VimMode::Insert);
+        form.active_text_field_mut().unwrap().insert('x');
+        assert_eq!(form.structured[4].value, "x");
+    }
+
+    #[test]
+    fn visual_mode_deletes_the_highlighted_character_range() {
+        let mut form = RuleForm::new();
+        form.field_idx = 4;
+        form.structured[4] = TextField::from("hello");
+        form.structured[4].home();
+        form.enter_visual();
+        form.active_text_field_mut().unwrap().right();
+        form.active_text_field_mut().unwrap().right();
+        assert_eq!(form.visual_range(4), Some((0, 3)));
+        form.delete_visual_selection(false);
+        assert_eq!(form.structured[4].value, "lo");
+        assert_eq!(form.vim_mode, VimMode::Normal);
     }
 }

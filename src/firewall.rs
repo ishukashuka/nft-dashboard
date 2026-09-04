@@ -34,6 +34,67 @@ impl RuleDraft {
             "accept", "drop", "reject", "continue", "return", "jump", "goto",
         ]
     }
+
+    fn normalize_port_expression(value: &str) -> String {
+        let value = value.trim();
+        let (operator, value) = value
+            .strip_prefix("!=")
+            .map(|rest| ("!= ", rest.trim()))
+            .unwrap_or(("", value));
+        if value.contains(',') && !(value.starts_with('{') && value.ends_with('}')) {
+            let members = value
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}{{ {} }}", operator, members)
+        } else {
+            format!("{}{}", operator, value)
+        }
+    }
+
+    fn valid_port_expression(value: &str) -> bool {
+        let value = value
+            .trim()
+            .strip_prefix("!=")
+            .map(str::trim)
+            .unwrap_or(value.trim());
+        if value.is_empty() || value == "any" {
+            return true;
+        }
+        let has_open = value.starts_with('{');
+        let has_close = value.ends_with('}');
+        if has_open != has_close {
+            return false;
+        }
+        let value = if has_open {
+            value[1..value.len() - 1].trim()
+        } else {
+            value
+        };
+        value.split(',').all(|member| {
+            let member = member.trim();
+            if member.is_empty() {
+                return false;
+            }
+            if let Ok(port) = member.parse::<u32>() {
+                return port <= u16::MAX as u32;
+            }
+            if let Some((start, end)) = member.split_once('-') {
+                if let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) {
+                    return start <= end && end <= u16::MAX as u32;
+                }
+            }
+            member
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+                && member
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+        })
+    }
+
     pub fn generated_for_family(&self, family: &str) -> String {
         let mut parts = Vec::new();
         let address_protocol = |value: &str| {
@@ -59,10 +120,16 @@ impl RuleDraft {
             parts.push(self.protocol.clone());
         }
         if !self.source_port.trim().is_empty() && self.source_port != "any" {
-            parts.push(format!("sport {}", self.source_port));
+            parts.push(format!(
+                "sport {}",
+                Self::normalize_port_expression(&self.source_port)
+            ));
         }
         if !self.destination_port.trim().is_empty() && self.destination_port != "any" {
-            parts.push(format!("dport {}", self.destination_port));
+            parts.push(format!(
+                "dport {}",
+                Self::normalize_port_expression(&self.destination_port)
+            ));
         }
         if !self.ct_state.trim().is_empty() {
             parts.push(format!("ct state {}", self.ct_state));
@@ -106,6 +173,16 @@ impl RuleDraft {
             && (!self.source_port.trim().is_empty() || !self.destination_port.trim().is_empty())
         {
             return Some("Ports are only valid with TCP, UDP, or SCTP.".into());
+        }
+        if !Self::valid_port_expression(&self.source_port) {
+            return Some(
+                "Source port must be a service, port, range, or comma-separated list.".into(),
+            );
+        }
+        if !Self::valid_port_expression(&self.destination_port) {
+            return Some(
+                "Destination port must be a service, port, range, or comma-separated list.".into(),
+            );
         }
         if (family == "ip" && self.protocol == "icmpv6")
             || (family == "ip6" && self.protocol == "icmp")
@@ -325,6 +402,39 @@ mod tests {
         assert!(d
             .generated_for_family("ip")
             .contains("ip saddr 10.0.0.0/8 udp sport 53 dport 5353 accept"));
+    }
+    #[test]
+    fn comma_separated_radius_ports_generate_an_nft_set() {
+        let mut draft = RuleDraft::new();
+        draft.protocol = "udp".into();
+        draft.destination_port = "1812,1813".into();
+        draft.counter = true;
+        assert_eq!(
+            draft.generated_for_family("inet"),
+            "udp dport { 1812, 1813 } counter accept"
+        );
+        assert!(draft.validation_error("inet").is_none());
+    }
+
+    #[test]
+    fn existing_nft_port_sets_are_not_wrapped_twice() {
+        let mut draft = RuleDraft::new();
+        draft.protocol = "tcp".into();
+        draft.destination_port = "{ 80, 443 }".into();
+        assert_eq!(
+            draft.generated_for_family("ip"),
+            "tcp dport { 80, 443 } accept"
+        );
+    }
+
+    #[test]
+    fn invalid_port_lists_fail_before_running_nft() {
+        let mut draft = RuleDraft::new();
+        draft.protocol = "udp".into();
+        draft.destination_port = "1812,".into();
+        assert!(draft.validation_error("inet").is_some());
+        draft.destination_port = "70000".into();
+        assert!(draft.validation_error("inet").is_some());
     }
     #[test]
     fn jump_requires_target() {
