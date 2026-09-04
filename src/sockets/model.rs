@@ -61,26 +61,4 @@ impl SocketEntry {
             self.pid()
         )
     }
-    pub fn matches_filter(&self, query: &str) -> bool {
-        let haystack = [
-            self.protocol.clone(),
-            self.state.clone(),
-            self.local.address.clone(),
-            self.local.port.clone(),
-            self.local.display(),
-            self.remote
-                .as_ref()
-                .map(|e| e.address.clone())
-                .unwrap_or_default(),
-            self.remote
-                .as_ref()
-                .map(|e| e.port.clone())
-                .unwrap_or_default(),
-            self.process_name(),
-            self.pid(),
-        ]
-        .join(" ")
-        .to_lowercase();
-        haystack.contains(&query.to_lowercase())
-    }
 }

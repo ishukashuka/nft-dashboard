@@ -1,4 +1,6 @@
 use crate::{
+    chains::{ChainDestructiveAction, ChainForm},
+    filter::FilterQuery,
     firewall, network, sockets, FirewallChain, FirewallTable, InspectorTab, Rule, RulesetSnapshot,
     SocketTab,
 };
@@ -171,6 +173,9 @@ pub(crate) enum Mode {
     Sort,
     Command,
     CommandOutput,
+    ChainEdit,
+    ChainReview,
+    ChainConfirm,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -506,8 +511,14 @@ pub(crate) struct App {
     pub(crate) mode: Mode,
     pub(crate) form: RuleForm,
     pub(crate) filter: TextField,
+    pub(crate) filter_error: String,
+    firewall_query: FilterQuery,
     pub(crate) network_filter: TextField,
+    pub(crate) network_filter_error: String,
+    network_query: FilterQuery,
     pub(crate) socket_filter: TextField,
+    pub(crate) socket_filter_error: String,
+    socket_query: FilterQuery,
     pub(crate) pending_g: bool,
     pub(crate) command: TextField,
     pub(crate) command_output: String,
@@ -524,6 +535,8 @@ pub(crate) struct App {
     pub(crate) network_focus: bool,
     pub(crate) network_form: Option<NetworkForm>,
     pub(crate) network_action: String,
+    pub(crate) chain_form: Option<ChainForm>,
+    pub(crate) chain_destructive_action: ChainDestructiveAction,
     pub(crate) sort_key: firewall::SortKey,
     pub(crate) sort_reverse: bool,
     pub(crate) sort_index: usize,
@@ -584,8 +597,14 @@ impl App {
             mode: Mode::Normal,
             form: RuleForm::new(),
             filter: TextField::default(),
+            filter_error: String::new(),
+            firewall_query: FilterQuery::default(),
             network_filter: TextField::default(),
+            network_filter_error: String::new(),
+            network_query: FilterQuery::default(),
             socket_filter: TextField::default(),
+            socket_filter_error: String::new(),
+            socket_query: FilterQuery::default(),
             pending_g: false,
             command: TextField::default(),
             command_output: String::new(),
@@ -602,6 +621,8 @@ impl App {
             network_focus: false,
             network_form: None,
             network_action: String::new(),
+            chain_form: None,
+            chain_destructive_action: ChainDestructiveAction::Delete,
             sort_key: firewall::SortKey::ChainOrder,
             sort_reverse: false,
             sort_index: 0,
@@ -683,6 +704,24 @@ impl App {
             .and_then(|index| self.chains.get(*index))
     }
 
+    pub(crate) fn select_firewall_chain(&mut self, family: &str, table: &str, name: &str) {
+        if let Some(index) = self
+            .tables
+            .iter()
+            .position(|entry| entry.family == family && entry.name == table)
+        {
+            self.sidebar_state.select(Some(index + 1));
+            self.recompute_chains();
+            if let Some(index) = self.visible_chains.iter().position(|index| {
+                let chain = &self.chains[*index];
+                chain.family == family && chain.table == table && chain.name == name
+            }) {
+                self.chain_state.select(Some(index + 1));
+            }
+            self.recompute_visible();
+        }
+    }
+
     pub(crate) fn new_rule_form_for_selection(&self) -> RuleForm {
         let mut form = RuleForm::new();
         if let Some(table) = self.selected_firewall_table() {
@@ -747,7 +786,34 @@ impl App {
         let selected_identity = self
             .selected_rule()
             .map(|r| (r.family.clone(), r.table.clone(), r.chain.clone(), r.handle));
-        let q = self.filter.value.trim().to_lowercase();
+        match FilterQuery::parse(
+            self.filter.value.trim(),
+            &[
+                "family",
+                "table",
+                "chain",
+                "handle",
+                "src",
+                "dst",
+                "iface",
+                "proto",
+                "port",
+                "action",
+                "comment",
+                "packets",
+                "bytes",
+                "counter",
+                "expression",
+            ],
+            &["handle", "packets", "bytes", "port"],
+        ) {
+            Ok(query) => {
+                self.firewall_query = query;
+                self.filter_error.clear();
+            }
+            Err(error) => self.filter_error = error,
+        }
+        let all_scope = self.firewall_query.all_scope;
         let selected_table = self
             .selected_firewall_table()
             .map(|table| (table.family.clone(), table.name.clone()));
@@ -764,15 +830,40 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, r)| {
-                let matches_tree = selected_table
-                    .as_ref()
-                    .is_none_or(|(family, table)| r.family == *family && r.table == *table);
-                let matches_chain = selected_chain
-                    .as_ref()
-                    .is_none_or(|(family, table, chain)| {
-                        r.family == *family && r.table == *table && r.chain == *chain
-                    });
-                let matches_q = q.is_empty() || r.matches_filter(&q);
+                let matches_tree = all_scope
+                    || selected_table
+                        .as_ref()
+                        .is_none_or(|(family, table)| r.family == *family && r.table == *table);
+                let matches_chain = all_scope
+                    || selected_chain
+                        .as_ref()
+                        .is_none_or(|(family, table, chain)| {
+                            r.family == *family && r.table == *table && r.chain == *chain
+                        });
+                let (packets, bytes) = parse_counter(&r.parsed.counters);
+                let mut fields = vec![
+                    ("family", r.family.clone()),
+                    ("table", r.table.clone()),
+                    ("chain", r.chain.clone()),
+                    ("handle", r.handle.to_string()),
+                    ("src", r.parsed.src.clone()),
+                    ("dst", r.parsed.dst.clone()),
+                    ("iface", format!("{} {}", r.parsed.src, r.parsed.dst)),
+                    ("proto", r.parsed.proto_port.clone()),
+                    ("port", r.parsed.proto_port.clone()),
+                    ("action", r.parsed.action.clone()),
+                    ("comment", r.comment.clone().unwrap_or_default()),
+                    ("packets", packets.to_string()),
+                    ("bytes", bytes.to_string()),
+                    ("counter", r.parsed.counters.clone()),
+                    ("expression", r.expression.clone()),
+                ];
+                fields.extend(
+                    r.filter_port_values()
+                        .into_iter()
+                        .map(|port| ("port", port)),
+                );
+                let matches_q = self.firewall_query.matches(&fields);
                 matches_tree && matches_chain && matches_q
             })
             .map(|(i, _)| i)
@@ -943,12 +1034,58 @@ impl App {
     }
 
     pub(crate) fn recompute_socket_visible(&mut self) {
-        let query = self.socket_filter.value.trim().to_lowercase();
+        match FilterQuery::parse(
+            self.socket_filter.value.trim(),
+            &[
+                "proto", "local", "remote", "address", "port", "process", "pid", "state", "family",
+                "user",
+            ],
+            &["port", "pid"],
+        ) {
+            Ok(query) => {
+                self.socket_query = query;
+                self.socket_filter_error.clear();
+            }
+            Err(error) => self.socket_filter_error = error,
+        }
         self.socket_visible = self
             .sockets
             .iter()
             .enumerate()
-            .filter(|(_, s)| query.is_empty() || s.matches_filter(&query))
+            .filter(|(_, socket)| {
+                let remote_address = socket
+                    .remote
+                    .as_ref()
+                    .map(|endpoint| endpoint.address.clone())
+                    .unwrap_or_default();
+                let remote_port = socket
+                    .remote
+                    .as_ref()
+                    .map(|endpoint| endpoint.port.clone())
+                    .unwrap_or_default();
+                let users = socket
+                    .owners
+                    .iter()
+                    .filter_map(|owner| owner.user.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.socket_query.matches(&[
+                    ("proto", socket.protocol.clone()),
+                    ("local", socket.local.display()),
+                    ("remote", format!("{} {}", remote_address, remote_port)),
+                    (
+                        "address",
+                        format!("{} {}", socket.local.address, remote_address),
+                    ),
+                    ("port", socket.local.port.clone()),
+                    ("port", remote_port),
+                    ("process", socket.process_name()),
+                    ("pid", socket.pid()),
+                    ("state", socket.state.clone()),
+                    ("family", socket.local.family.clone()),
+                    ("user", users),
+                ])
+            })
             .map(|(i, _)| i)
             .collect();
         self.socket_selected = self
@@ -957,38 +1094,64 @@ impl App {
     }
 
     pub(crate) fn network_visible_indices(&self) -> Vec<usize> {
-        let query = self.network_filter.value.trim().to_lowercase();
         self.profiles
             .iter()
             .enumerate()
             .filter(|(_, profile)| {
-                query.is_empty()
-                    || [
-                        profile.name.as_str(),
-                        profile.kind.as_str(),
-                        profile.device.as_str(),
-                        profile.state.as_str(),
-                        profile.autoconnect.as_str(),
-                        profile.ipv4_method.as_str(),
-                        profile.gateway.as_str(),
-                    ]
+                let routes = profile
+                    .routes
                     .iter()
-                    .any(|value| value.to_lowercase().contains(&query))
-                    || profile
-                        .addresses
-                        .iter()
-                        .chain(&profile.runtime_addresses)
-                        .chain(&profile.dns)
-                        .chain(&profile.search)
-                        .any(|value| value.to_lowercase().contains(&query))
-                    || profile.routes.iter().any(|route| {
-                        route.destination.to_lowercase().contains(&query)
-                            || route.gateway.to_lowercase().contains(&query)
-                            || route.metric.to_lowercase().contains(&query)
+                    .map(|route| {
+                        format!("{} {} {}", route.destination, route.gateway, route.metric)
                     })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.network_query.matches(&[
+                    ("name", profile.name.clone()),
+                    ("type", profile.kind.clone()),
+                    ("device", profile.device.clone()),
+                    ("state", profile.state.clone()),
+                    ("autoconnect", profile.autoconnect.clone()),
+                    ("method", profile.ipv4_method.clone()),
+                    ("address", profile.addresses.join(" ")),
+                    ("address", profile.runtime_addresses.join(" ")),
+                    ("gateway", profile.gateway.clone()),
+                    ("metric", profile.metric.clone()),
+                    ("dns", profile.dns.join(" ")),
+                    ("search", profile.search.join(" ")),
+                    ("route", routes),
+                ])
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    pub(crate) fn update_network_filter(&mut self) {
+        match FilterQuery::parse(
+            self.network_filter.value.trim(),
+            &[
+                "name",
+                "type",
+                "device",
+                "state",
+                "autoconnect",
+                "method",
+                "address",
+                "gateway",
+                "metric",
+                "dns",
+                "search",
+                "route",
+            ],
+            &["metric"],
+        ) {
+            Ok(query) => {
+                self.network_query = query;
+                self.network_filter_error.clear();
+            }
+            Err(error) => self.network_filter_error = error,
+        }
+        self.repair_network_selection();
     }
 
     pub(crate) fn repair_network_selection(&mut self) {
@@ -1130,10 +1293,76 @@ mod tests {
             },
         ];
         app.network_filter = TextField::from("1.1.1.1");
-        app.repair_network_selection();
+        app.update_network_filter();
         assert_eq!(app.network_visible_indices(), vec![1]);
         assert_eq!(app.network_selected, 1);
         assert_eq!(app.selected_network_profile().unwrap().name, "uplink");
+    }
+
+    #[test]
+    fn network_filter_combines_fields_and_keeps_last_valid_query() {
+        let mut app = App::new();
+        app.profiles = vec![
+            network::Profile {
+                name: "office-lan".into(),
+                device: "eth0".into(),
+                state: "activated".into(),
+                metric: "100".into(),
+                ..Default::default()
+            },
+            network::Profile {
+                name: "backup-wan".into(),
+                device: "eth1".into(),
+                state: "deactivated".into(),
+                metric: "500".into(),
+                ..Default::default()
+            },
+        ];
+
+        app.network_filter = TextField::from("state:activated metric:<200 !device:eth1");
+        app.update_network_filter();
+        assert_eq!(app.network_visible_indices(), vec![0]);
+
+        app.network_filter = TextField::from("unknown:value");
+        app.update_network_filter();
+        assert!(!app.network_filter_error.is_empty());
+        assert_eq!(app.network_visible_indices(), vec![0]);
+    }
+
+    #[test]
+    fn socket_filter_combines_protocol_port_process_and_negation() {
+        let mut app = App::new();
+        app.sockets = vec![
+            sockets::model::SocketEntry {
+                protocol: "tcp".into(),
+                state: "ESTAB".into(),
+                local: sockets::model::Endpoint {
+                    address: "10.0.0.2".into(),
+                    port: "443".into(),
+                    family: "inet".into(),
+                },
+                owners: vec![sockets::model::ProcessOwner {
+                    name: "nginx".into(),
+                    pid: Some(42),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            sockets::model::SocketEntry {
+                protocol: "udp".into(),
+                state: "UNCONN".into(),
+                local: sockets::model::Endpoint {
+                    address: "0.0.0.0".into(),
+                    port: "53".into(),
+                    family: "inet".into(),
+                },
+                ..Default::default()
+            },
+        ];
+
+        app.socket_filter = TextField::from("proto:tcp port:>=443 process:nginx !state:listen");
+        app.recompute_socket_visible();
+        assert_eq!(app.socket_visible, vec![0]);
     }
 
     #[test]

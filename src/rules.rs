@@ -131,14 +131,27 @@ pub(crate) struct RulesetSnapshot {
 }
 
 impl Rule {
-    pub(crate) fn matches_filter(&self, q: &str) -> bool {
-        self.family.to_lowercase().contains(q)
-            || self.table.to_lowercase().contains(q)
-            || self.chain.to_lowercase().contains(q)
-            || self.expression.to_lowercase().contains(q)
-            || self.parsed.src.to_lowercase().contains(q)
-            || self.parsed.dst.to_lowercase().contains(q)
-            || self.handle.to_string().contains(q)
+    pub(crate) fn filter_port_values(&self) -> Vec<String> {
+        let mut ports = Vec::new();
+        let Some(expressions) = self.raw.as_array() else {
+            return ports;
+        };
+        for expression in expressions {
+            let Some(rule_match) = expression.get("match") else {
+                continue;
+            };
+            let left = rule_match
+                .get("left")
+                .map(describe_operand)
+                .unwrap_or_default()
+                .to_lowercase();
+            if left.contains("sport") || left.contains("dport") {
+                if let Some(right) = rule_match.get("right") {
+                    collect_filter_scalars(right, &mut ports);
+                }
+            }
+        }
+        ports
     }
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
@@ -220,6 +233,24 @@ impl Rule {
             "This rule will {} matching traffic: source {}, destination {}, and {}.",
             action, self.parsed.src, self.parsed.dst, self.parsed.proto_port
         )
+    }
+}
+
+fn collect_filter_scalars(value: &Value, output: &mut Vec<String>) {
+    if let Some(values) = value.get("set").and_then(Value::as_array) {
+        for value in values {
+            collect_filter_scalars(value, output);
+        }
+    } else if let Some(values) = value.get("range").and_then(Value::as_array) {
+        for value in values {
+            collect_filter_scalars(value, output);
+        }
+    } else if let Some(values) = value.as_array() {
+        for value in values {
+            collect_filter_scalars(value, output);
+        }
+    } else {
+        output.push(describe_operand(value));
     }
 }
 
@@ -718,6 +749,30 @@ mod tests {
         assert_eq!(parsed.action, "dnat to 172.17.0.2:80");
         assert!(statement.contains("tcp dport 8000-8005"));
         assert_eq!(verdict, Verdict::Translate);
+    }
+
+    #[test]
+    fn exposes_individual_ports_from_sets_for_numeric_filters() {
+        let rule = Rule {
+            family: "inet".into(),
+            table: "pintech".into(),
+            chain: "input".into(),
+            handle: 1,
+            parsed: ParsedRuleExpr::default(),
+            expression: String::new(),
+            exact_expression: None,
+            verdict: Verdict::Other,
+            raw: serde_json::json!([{
+                "match": {
+                    "left": {"payload": {"protocol": "udp", "field": "dport"}},
+                    "op": "==",
+                    "right": {"set": [1812, 1813]}
+                }
+            }]),
+            comment: None,
+        };
+
+        assert_eq!(rule.filter_port_values(), vec!["1812", "1813"]);
     }
 
     #[test]

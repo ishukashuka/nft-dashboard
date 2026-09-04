@@ -198,10 +198,17 @@ pub(crate) fn draw_ports(f: &mut ratatui::Frame, app: &App) {
         f.render_stateful_widget(table, pane[1], &mut state);
     }
     let footer: String = if app.mode == Mode::Filter {
-        format!(
-            " Filter: {}  [Enter] Keep  [Esc] Clear ",
-            app.socket_filter.value
-        )
+        if app.socket_filter_error.is_empty() {
+            format!(
+                " Filter: {}  · AND · field:value · !exclude · re:pattern ",
+                app.socket_filter.value
+            )
+        } else {
+            format!(
+                " Filter: {}  · ERROR: {} ",
+                app.socket_filter.value, app.socket_filter_error
+            )
+        }
     } else if app.mode == Mode::Detail {
         " h/l Tab  j/k Scroll  Esc Back  ? Keys ".into()
     } else {
@@ -210,11 +217,13 @@ pub(crate) fn draw_ports(f: &mut ratatui::Frame, app: &App) {
     };
     let footer_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
     f.render_widget(
-        Paragraph::new(footer).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT)),
-        ),
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL).border_style(
+            Style::default().fg(if app.socket_filter_error.is_empty() {
+                ACCENT
+            } else {
+                Color::Red
+            }),
+        )),
         chunks[2],
     );
     if app.mode == Mode::Filter {
@@ -486,18 +495,25 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
         Mode::NetworkConfirm => " [y] Apply  [Esc] Cancel ".into(),
         Mode::Error => " [Esc] Back  [F1/F2/F3] Section ".into(),
         Mode::Filter => format!(
-            " Filter: {}  [Enter] Keep  [Esc] Clear ",
-            app.network_filter.value
+            " Filter: {}  {} ",
+            app.network_filter.value,
+            if app.network_filter_error.is_empty() {
+                "· AND · field:value · !exclude · re:pattern".to_string()
+            } else {
+                format!("ERROR: {}", app.network_filter_error)
+            }
         ),
         _ => " Tab Pane  h/l Tab  j/k Move  gg/G First/Last  / Filter  : Command  e Edit  a Add  d Del  ? Keys  q Quit ".into(),
     };
     let footer_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
     f.render_widget(
-        Paragraph::new(footer).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT)),
-        ),
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL).border_style(
+            Style::default().fg(if app.network_filter_error.is_empty() {
+                ACCENT
+            } else {
+                Color::Red
+            }),
+        )),
         chunks[2],
     );
     if app.mode == Mode::Filter {
@@ -690,6 +706,156 @@ pub(crate) fn draw_help_modal(f: &mut ratatui::Frame, app: &App) {
         ),
         area,
     );
+}
+
+pub(crate) fn draw_chain_modal(f: &mut ratatui::Frame, app: &App) {
+    let area = centered_fixed(90, 22, f.size());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(match app.mode {
+            Mode::ChainEdit => " Chain editor ",
+            Mode::ChainReview => " Review chain transaction ",
+            Mode::ChainConfirm => " Destructive chain action ",
+            _ => " Chain ",
+        })
+        .style(Style::default().bg(MODAL))
+        .border_style(Style::default().fg(match app.mode {
+            Mode::ChainConfirm => Color::Red,
+            Mode::ChainReview => ACTIVE,
+            _ => ACCENT,
+        }));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.mode == Mode::ChainConfirm {
+        if let Some(chain) = app.selected_firewall_chain() {
+            let count = app
+                .rules
+                .iter()
+                .filter(|rule| {
+                    rule.family == chain.family
+                        && rule.table == chain.table
+                        && rule.chain == chain.name
+                })
+                .count();
+            let text = match app.chain_destructive_action {
+                ChainDestructiveAction::Flush => format!(
+                    "FLUSH {}/{} > {}\n\nThis permanently removes {} rule{}. The chain remains.\n\n[y] Confirm flush   [Esc/n] Cancel",
+                    chain.family,
+                    chain.table,
+                    chain.name,
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ),
+                ChainDestructiveAction::Delete => format!(
+                    "DELETE {}/{} > {}\n\nThis flushes {} rule{} and deletes the chain in one nft transaction. References from other chains may prevent deletion.\n\n[y] Confirm delete   [Esc/n] Cancel",
+                    chain.family,
+                    chain.table,
+                    chain.name,
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ),
+            };
+            f.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        return;
+    }
+
+    let Some(form) = app.chain_form.as_ref() else {
+        return;
+    };
+    if app.mode == Mode::ChainReview {
+        f.render_widget(
+            Paragraph::new(format!(
+                "{}\n\n[Enter] Apply atomically   [Esc] Back",
+                form.review()
+            ))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+
+    let values = [
+        format!("Name       {}", form.name.value),
+        format!(
+            "Kind       < {} >",
+            if form.base_chain { "base" } else { "regular" }
+        ),
+        format!("Type       {}", form.chain_type.value),
+        format!("Hook       {}", form.hook.value),
+        format!("Priority   {}", form.priority.value),
+        format!("Policy     < {} >", form.policy.value),
+        format!("Device     {}", form.device.value),
+    ];
+    let active = form.actual_field_index();
+    let mut lines = vec![
+        Line::from(format!("Location   {}/{}", form.family, form.table)),
+        Line::from(""),
+    ];
+    for (index, value) in values.iter().enumerate() {
+        let visible = if form.operation == ChainOperation::Add {
+            index <= 1 || form.base_chain
+        } else {
+            index == 0 || (form.base_chain && matches!(index, 2..=5))
+        };
+        if visible {
+            lines.push(Line::styled(
+                value.clone(),
+                if index == active {
+                    Style::default().fg(ACTIVE).add_modifier(Modifier::BOLD)
+                } else if form.operation == ChainOperation::Edit && !matches!(index, 0 | 5) {
+                    Style::default().fg(MUTED)
+                } else {
+                    Style::default()
+                },
+            ));
+        } else {
+            lines.push(Line::from(""));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        if form.operation == ChainOperation::Edit {
+            "Type, hook and priority are immutable. NORMAL: j/k field · h/l choice · i edit · Enter review · Esc cancel"
+        } else {
+            "NORMAL: j/k field · h/l choice · i edit · Enter review · Esc cancel"
+        },
+        Style::default().fg(MUTED),
+    ));
+    lines.push(Line::styled(
+        format!("-- {} --", form.vim_mode.label()),
+        Style::default().fg(if form.vim_mode == VimMode::Insert {
+            ACTIVE
+        } else {
+            ACCENT
+        }),
+    ));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    if form.vim_mode == VimMode::Insert {
+        if let Some(field) = match active {
+            0 => Some(&form.name),
+            2 => Some(&form.chain_type),
+            3 => Some(&form.hook),
+            4 => Some(&form.priority),
+            6 => Some(&form.device),
+            _ => None,
+        } {
+            let label_width = 11;
+            f.set_cursor(
+                (inner.x + label_width + field.cursor as u16).min(inner.right().saturating_sub(1)),
+                inner.y + 2 + active as u16,
+            );
+        }
+    }
 }
 
 pub(crate) fn draw_command_bar(f: &mut ratatui::Frame, app: &App) {

@@ -23,6 +23,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time;
+mod chains;
+mod filter;
 mod firewall;
 mod network;
 mod rules;
@@ -30,6 +32,7 @@ mod sockets;
 mod state;
 mod views;
 
+use chains::*;
 use rules::*;
 use state::*;
 use views::*;
@@ -46,6 +49,7 @@ impl Drop for TerminalGuard {
 async fn open_firewall(app: &mut App) {
     app.section = Section::Firewall;
     app.network_form = None;
+    app.chain_form = None;
     app.network_focus = false;
     match fetch_ruleset().await {
         Ok(snapshot) => {
@@ -354,7 +358,11 @@ async fn main() -> Result<()> {
             }
 
             let footer_text = match app.mode {
-                Mode::Normal => " j/k Move  gg/G First/Last  Enter Inspect  a Add  e Edit  x Del  : Command  ? Keys ",
+                Mode::Normal => match app.focus {
+                    Focus::Sidebar => " Tables are read-only  j/k Move  Tab Chains  : Command  ? Keys ",
+                    Focus::Chains => " Chains  a New  e Rename/Policy  X Flush  x Delete  j/k Move  ? Keys ",
+                    Focus::Table => " Rules  a Add  i Insert  e Edit  x Delete  Enter Inspect  s Sort  ? Keys ",
+                },
                 Mode::Add | Mode::Insert | Mode::Edit => " Tab Field  j/k Select  Space Toggle  F4 Advanced  Enter Review  Esc Cancel ",
                 Mode::ConfirmDelete => " [y] Confirm Delete | [n/Esc] Cancel ",
                 Mode::Filter => " Filter: ",
@@ -368,6 +376,9 @@ async fn main() -> Result<()> {
                 Mode::Sort => " [j/k] Choose sort | [Enter] Apply | [Esc] Cancel ",
                 Mode::Command => " :!command  Enter Run  Esc Cancel ",
                 Mode::CommandOutput => " j/k Scroll  Esc/Enter Close ",
+                Mode::ChainEdit => " NORMAL j/k Field  h/l Choice  i Insert  Enter Review  Esc Cancel ",
+                Mode::ChainReview => " [Enter] Apply chain change  [Esc] Back ",
+                Mode::ChainConfirm => " [y] Confirm destructive action  [n/Esc] Cancel ",
             };
 
             let footer_layout = Layout::default()
@@ -377,8 +388,16 @@ async fn main() -> Result<()> {
 
             let footer_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT));
             if app.mode == Mode::Filter {
-                let inner = footer_block.inner(footer_layout[0]);
-                f.render_widget(footer_block.clone().title(" Filter (live) "), footer_layout[0]);
+                let title = if app.filter_error.is_empty() {
+                    " Filter · terms use AND · field:value · !exclude · re:pattern ".to_string()
+                } else {
+                    format!(" Filter error · {} ", app.filter_error)
+                };
+                let filter_block = footer_block.clone().title(title).border_style(
+                    Style::default().fg(if app.filter_error.is_empty() { ACCENT } else { Color::Red }),
+                );
+                let inner = filter_block.inner(footer_layout[0]);
+                f.render_widget(filter_block, footer_layout[0]);
                 f.render_widget(Paragraph::new(app.filter.value.as_str()), inner);
                 f.set_cursor((inner.x + app.filter.cursor as u16).min(inner.right().saturating_sub(1)), inner.y);
             } else {
@@ -575,6 +594,9 @@ async fn main() -> Result<()> {
                 }
                 Mode::Command => draw_command_bar(f, &app),
                 Mode::CommandOutput => draw_command_output(f, &app),
+                Mode::ChainEdit | Mode::ChainReview | Mode::ChainConfirm => {
+                    draw_chain_modal(f, &app)
+                }
                 _ => {}
             }
         })?;
@@ -622,12 +644,13 @@ async fn main() -> Result<()> {
                     app.mode = Mode::Command;
                     continue;
                 }
-                let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort | Mode::Command | Mode::CommandOutput);
+                let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort | Mode::Command | Mode::CommandOutput | Mode::ChainEdit | Mode::ChainReview | Mode::ChainConfirm);
                 if key.code == KeyCode::F(1) && !section_switch_owned {
                     open_firewall(&mut app).await;
                     continue;
                 }
                 if key.code == KeyCode::F(2) && !section_switch_owned {
+                    app.chain_form = None;
                     match network::load_profiles().await {
                         Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.repair_network_selection(); app.section = Section::Network; app.mode = Mode::Normal; app.network_focus = true; app.error_msg.clear(); app.status_msg = "Network loaded".into(); }
                         Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; }
@@ -635,6 +658,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 if key.code == KeyCode::F(3) && !section_switch_owned {
+                    app.chain_form = None;
                     let listening = app.socket_tab == SocketTab::Listening;
                     match sockets::client::load(listening).await {
                         Ok(entries) => { app.replace_sockets(entries); if app.section != Section::Ports { app.previous_section = app.section; } app.section = Section::Ports; app.mode = Mode::Normal; app.error_msg.clear(); app.status_msg = "Ports loaded".into(); }
@@ -645,7 +669,7 @@ async fn main() -> Result<()> {
                 if app.section == Section::Ports && app.mode != Mode::Normal {
                     match app.mode {
                         Mode::Detail => match key.code { KeyCode::Esc => app.mode = Mode::Normal, KeyCode::Char('j') | KeyCode::Down => app.detail_scroll = app.detail_scroll.saturating_add(1), KeyCode::Char('k') | KeyCode::Up => app.detail_scroll = app.detail_scroll.saturating_sub(1), KeyCode::Char('h') | KeyCode::Left => { app.socket_inspector_tab = app.socket_inspector_tab.previous(); app.detail_scroll = 0; }, KeyCode::Char('l') | KeyCode::Right => { app.socket_inspector_tab = app.socket_inspector_tab.next(); app.detail_scroll = 0; }, _ => {} },
-                        Mode::Filter => match key.code { KeyCode::Esc => { app.socket_filter.clear(); app.recompute_socket_visible(); app.mode = Mode::Normal; }, KeyCode::Enter => app.mode = Mode::Normal, KeyCode::Left => app.socket_filter.left(), KeyCode::Right => app.socket_filter.right(), KeyCode::Home => app.socket_filter.home(), KeyCode::End => app.socket_filter.end(), KeyCode::Backspace => { app.socket_filter.backspace(); app.recompute_socket_visible(); }, KeyCode::Delete => { app.socket_filter.delete(); app.recompute_socket_visible(); }, KeyCode::Char(c) => { app.socket_filter.insert(c); app.recompute_socket_visible(); }, _ => {} },
+                        Mode::Filter => match key.code { KeyCode::Esc => { app.socket_filter.clear(); app.recompute_socket_visible(); app.mode = Mode::Normal; }, KeyCode::Enter if app.socket_filter_error.is_empty() => app.mode = Mode::Normal, KeyCode::Left => app.socket_filter.left(), KeyCode::Right => app.socket_filter.right(), KeyCode::Home => app.socket_filter.home(), KeyCode::End => app.socket_filter.end(), KeyCode::Backspace => { app.socket_filter.backspace(); app.recompute_socket_visible(); }, KeyCode::Delete => { app.socket_filter.delete(); app.recompute_socket_visible(); }, KeyCode::Char(c) => { app.socket_filter.insert(c); app.recompute_socket_visible(); }, _ => {} },
                         Mode::Error | Mode::Help => if matches!(key.code, KeyCode::Esc | KeyCode::Enter) { app.error_msg.clear(); app.mode = Mode::Normal; },
                         _ => {}
                     }
@@ -732,15 +756,17 @@ async fn main() -> Result<()> {
                             _ => {}
                         },
                         Mode::Filter => match key.code {
-                            KeyCode::Esc => { app.network_filter.clear(); app.repair_network_selection(); app.mode = Mode::Normal; },
-                            KeyCode::Enter => app.mode = Mode::Normal,
+                            KeyCode::Esc => { app.network_filter.clear(); app.update_network_filter(); app.mode = Mode::Normal; },
+                            KeyCode::Enter if app.network_filter_error.is_empty() => {
+                                app.mode = Mode::Normal
+                            }
                             KeyCode::Left => app.network_filter.left(),
                             KeyCode::Right => app.network_filter.right(),
                             KeyCode::Home => app.network_filter.home(),
                             KeyCode::End => app.network_filter.end(),
-                            KeyCode::Backspace => { app.network_filter.backspace(); app.repair_network_selection(); },
-                            KeyCode::Delete => { app.network_filter.delete(); app.repair_network_selection(); },
-                            KeyCode::Char(c) => { app.network_filter.insert(c); app.repair_network_selection(); },
+                            KeyCode::Backspace => { app.network_filter.backspace(); app.update_network_filter(); },
+                            KeyCode::Delete => { app.network_filter.delete(); app.update_network_filter(); },
+                            KeyCode::Char(c) => { app.network_filter.insert(c); app.update_network_filter(); },
                             _ => {}
                         },
                         Mode::Error | Mode::Help => if matches!(key.code, KeyCode::Esc | KeyCode::Enter) { app.error_msg.clear(); app.mode = Mode::Normal; },
@@ -793,12 +819,40 @@ async fn main() -> Result<()> {
                         KeyCode::Char('g') if app.pending_g => { app.go_first(); app.pending_g = false; },
                         KeyCode::Char('g') => app.pending_g = true,
                         KeyCode::Char('G') => app.go_last(),
-                        KeyCode::Char('a') => {
+                        KeyCode::Char('a') if app.focus == Focus::Chains => {
+                            if let Some(table) = app.selected_firewall_table() {
+                                app.chain_form = Some(ChainForm::new(&table.family, &table.name));
+                                app.mode = Mode::ChainEdit;
+                            } else {
+                                app.status_msg = "Select a table before creating a chain".into();
+                            }
+                        }
+                        KeyCode::Char('e') if app.focus == Focus::Chains => {
+                            if let Some(chain) = app.selected_firewall_chain() {
+                                app.chain_form = Some(ChainForm::edit(chain));
+                                app.mode = Mode::ChainEdit;
+                            } else {
+                                app.status_msg = "Select a specific chain to edit".into();
+                            }
+                        }
+                        KeyCode::Char('x') if app.focus == Focus::Chains => {
+                            if app.selected_firewall_chain().is_some() {
+                                app.chain_destructive_action = ChainDestructiveAction::Delete;
+                                app.mode = Mode::ChainConfirm;
+                            }
+                        }
+                        KeyCode::Char('X') if app.focus == Focus::Chains => {
+                            if app.selected_firewall_chain().is_some() {
+                                app.chain_destructive_action = ChainDestructiveAction::Flush;
+                                app.mode = Mode::ChainConfirm;
+                            }
+                        }
+                        KeyCode::Char('a') if app.focus == Focus::Table => {
                             app.form = app.new_rule_form_for_selection();
                             app.pending_operation = RuleOperation::Add;
                             app.mode = Mode::Add;
                         }
-                        KeyCode::Char('i') => {
+                        KeyCode::Char('i') if app.focus == Focus::Table => {
                             if let Some(rule) = app.selected_rule() {
                                 let mut form = RuleForm::from_rule(rule);
                                 form.statement.clear();
@@ -807,7 +861,7 @@ async fn main() -> Result<()> {
                                 app.mode = Mode::Insert;
                             }
                         }
-                        KeyCode::Char('e') => {
+                        KeyCode::Char('e') if app.focus == Focus::Table => {
                             if let Some(rule) = app.selected_rule() {
                                 let form = RuleForm::from_rule(rule);
                                 if form.unsupported && form.statement.value.is_empty() {
@@ -820,7 +874,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        KeyCode::Char('x') => { if app.selected_rule().is_some() { app.mode = Mode::ConfirmDelete; } }
+                        KeyCode::Char('x') if app.focus == Focus::Table => { if app.selected_rule().is_some() { app.mode = Mode::ConfirmDelete; } }
                         KeyCode::Char('v') | KeyCode::Enter => {
                             if app.selected_rule().is_some() {
                                 app.detail_scroll = 0;
@@ -831,7 +885,7 @@ async fn main() -> Result<()> {
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('s') => app.mode = Mode::Sort,
                         KeyCode::Char('S') => { app.sort_reverse = !app.sort_reverse; app.recompute_visible(); },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · j/k navigates · gg/G jumps first/last · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · :!command runs a shell command · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · actions follow the focused pane\nChains: a create · e rename/policy · X flush · x delete\nRules: a append · i insert · e edit · x delete · Enter inspect\nGlobal: j/k navigate · gg/G first/last · / filter · s sort · :!command shell · r refresh · F1/F2/F3 section · q quit".into(); app.mode = Mode::Help; },
                         KeyCode::Char('r') => match fetch_ruleset().await {
                             Ok(snapshot) => { app.apply_firewall_snapshot(snapshot); app.status_msg = "Refreshed".to_string(); }
                             Err(e) => app.status_msg = format!("Refresh failed: {}", e),
@@ -840,6 +894,169 @@ async fn main() -> Result<()> {
                             Ok(p) => { app.profiles = p; app.network_selected = 0; app.repair_network_selection(); app.section = Section::Network; app.network_focus = true; app.status_msg = "Network loaded".into(); }
                             Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; }
                         },
+                        _ => {}
+                    },
+                    Mode::ChainEdit => {
+                        let Some(form) = app.chain_form.as_mut() else {
+                            app.mode = Mode::Normal;
+                            continue;
+                        };
+                        if form.vim_mode == VimMode::Normal && key.code == KeyCode::Enter {
+                            match form.validate() {
+                                Ok(()) => app.mode = Mode::ChainReview,
+                                Err(error) => app.status_msg = format!("Chain form: {error}"),
+                            }
+                            continue;
+                        }
+                        match form.vim_mode {
+                            VimMode::Normal => match key.code {
+                                KeyCode::Esc => {
+                                    app.chain_form = None;
+                                    app.mode = Mode::Normal;
+                                }
+                                KeyCode::Tab | KeyCode::Char('j') | KeyCode::Down => {
+                                    form.next_field()
+                                }
+                                KeyCode::BackTab | KeyCode::Char('k') | KeyCode::Up => {
+                                    form.previous_field()
+                                }
+                                KeyCode::Char('g') if app.pending_g => {
+                                    form.field_idx = 0;
+                                    app.pending_g = false;
+                                }
+                                KeyCode::Char('g') => app.pending_g = true,
+                                KeyCode::Char('G') => form.field_idx = form.field_count() - 1,
+                                KeyCode::Char('h') | KeyCode::Left => form.cycle_selector(-1),
+                                KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
+                                    form.cycle_selector(1)
+                                }
+                                KeyCode::Char('i') if form.active_field_mut().is_some() => {
+                                    form.vim_mode = VimMode::Insert
+                                }
+                                KeyCode::Char('I') if form.active_field_mut().is_some() => {
+                                    form.active_field_mut().unwrap().home();
+                                    form.vim_mode = VimMode::Insert;
+                                }
+                                KeyCode::Char('A') if form.active_field_mut().is_some() => {
+                                    form.active_field_mut().unwrap().end();
+                                    form.vim_mode = VimMode::Insert;
+                                }
+                                _ => {}
+                            },
+                            VimMode::Insert => match key.code {
+                                KeyCode::Esc => form.vim_mode = VimMode::Normal,
+                                KeyCode::Up => form.previous_field(),
+                                KeyCode::Down | KeyCode::Enter => form.next_field(),
+                                KeyCode::Left => {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.left();
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.right();
+                                    }
+                                }
+                                KeyCode::Home => {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.home();
+                                    }
+                                }
+                                KeyCode::End => {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.end();
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.backspace();
+                                    }
+                                }
+                                KeyCode::Delete => {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.delete();
+                                    }
+                                }
+                                KeyCode::Char(c)
+                                    if !key
+                                        .modifiers
+                                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                                {
+                                    if let Some(field) = form.active_field_mut() {
+                                        field.insert(c);
+                                    }
+                                }
+                                _ => {}
+                            },
+                            VimMode::Visual => form.vim_mode = VimMode::Normal,
+                        }
+                    }
+                    Mode::ChainReview => match key.code {
+                        KeyCode::Esc => app.mode = Mode::ChainEdit,
+                        KeyCode::Enter => {
+                            let identity = app.chain_form.as_ref().map(|form| {
+                                (
+                                    form.family.clone(),
+                                    form.table.clone(),
+                                    form.name.value.trim().to_string(),
+                                )
+                            });
+                            let result = if let Some(form) = app.chain_form.as_ref() {
+                                chains::apply(form).await
+                            } else {
+                                Ok(())
+                            };
+                            match result {
+                                Ok(()) => {
+                                    if let Ok(snapshot) = fetch_ruleset().await {
+                                        app.apply_firewall_snapshot(snapshot);
+                                        if let Some((family, table, name)) = identity {
+                                            app.select_firewall_chain(&family, &table, &name);
+                                        }
+                                    }
+                                    app.chain_form = None;
+                                    app.status_msg = "Chain transaction applied".into();
+                                    app.mode = Mode::Normal;
+                                }
+                                Err(error) => {
+                                    app.error_msg = error.to_string();
+                                    app.mode = Mode::Error;
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Mode::ChainConfirm => match key.code {
+                        KeyCode::Esc | KeyCode::Char('n') => app.mode = Mode::Normal,
+                        KeyCode::Char('y') => {
+                            let chain = app.selected_firewall_chain().cloned();
+                            let result = if let Some(chain) = chain.as_ref() {
+                                match app.chain_destructive_action {
+                                    ChainDestructiveAction::Flush => chains::flush(chain).await,
+                                    ChainDestructiveAction::Delete => {
+                                        chains::delete(chain, true).await
+                                    }
+                                }
+                            } else {
+                                Ok(())
+                            };
+                            match result {
+                                Ok(()) => {
+                                    if let Ok(snapshot) = fetch_ruleset().await {
+                                        app.apply_firewall_snapshot(snapshot);
+                                    }
+                                    app.status_msg = match app.chain_destructive_action {
+                                        ChainDestructiveAction::Flush => "Chain flushed".into(),
+                                        ChainDestructiveAction::Delete => "Chain deleted".into(),
+                                    };
+                                    app.mode = Mode::Normal;
+                                }
+                                Err(error) => {
+                                    app.error_msg = error.to_string();
+                                    app.mode = Mode::Error;
+                                }
+                            }
+                        }
                         _ => {}
                     },
                     Mode::Detail => match key.code {
@@ -986,7 +1203,7 @@ async fn main() -> Result<()> {
                             app.recompute_visible();
                             app.mode = Mode::Normal;
                         }
-                        KeyCode::Enter => app.mode = Mode::Normal,
+                        KeyCode::Enter if app.filter_error.is_empty() => app.mode = Mode::Normal,
                         KeyCode::Left => app.filter.left(),
                         KeyCode::Right => app.filter.right(),
                         KeyCode::Home => app.filter.home(),
@@ -1006,7 +1223,14 @@ async fn main() -> Result<()> {
                         _ => {}
                     },
                     Mode::Error => match key.code {
-                        KeyCode::Esc | KeyCode::Enter => { app.error_msg.clear(); app.mode = Mode::Normal; },
+                        KeyCode::Esc | KeyCode::Enter => {
+                            app.error_msg.clear();
+                            app.mode = if app.chain_form.is_some() {
+                                Mode::ChainReview
+                            } else {
+                                Mode::Normal
+                            };
+                        },
                         _ => {}
                     },
                     Mode::Help => match key.code {

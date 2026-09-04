@@ -28,7 +28,21 @@ Use `F1`, `F2`, and `F3` to switch workspaces. In list views, `j`/`k` moves one 
 
 Press `/` in Firewall, Network, or Ports to open a visible live filter. In Firewall, `s` chooses a sort field and `Shift+S` reverses the current sort direction. Press `e` to edit the selected rule; complex NAT, set, and range rules open directly in Advanced mode.
 
+Filters use a small, `rg`-inspired query language. Space-separated terms are combined with AND, so each term must match. Plain terms search every visible field; use `field:value` to target one field, `!` to exclude matches, double quotes for spaces, and `re:` for a regular expression. Matching is case-insensitive unless the term contains an uppercase character. Numeric fields accept `=`, `>`, `>=`, `<`, and `<=`, with optional `k`, `m`, or `g` suffixes.
+
+```text
+proto:udp port:1812,1813 action:accept
+table:pintech comment:"RADIUS Auth" !action:drop
+packets:>1k bytes:>=1m
+process:nginx port:>=443 !state:listen
+re:^wg address:10.0.0.0/8
+```
+
+Firewall fields are `family`, `table`, `chain`, `handle`, `src`, `dst`, `iface`, `proto`, `port`, `action`, `comment`, `packets`, `bytes`, `counter`, and `expression`. Add `@all` to search beyond the currently selected table and chain. Network fields are `name`, `type`, `device`, `state`, `autoconnect`, `method`, `address`, `gateway`, `metric`, `dns`, `search`, and `route`. Ports fields are `proto`, `local`, `remote`, `address`, `port`, `process`, `pid`, `state`, `family`, and `user`. Invalid fields, expressions, or unfinished quotes are shown inline while the last valid result set remains visible.
+
 The Firewall workspace reads tables, chains, and rules as separate nftables objects. Empty tables and chains remain visible in the hierarchy, and chain entries show their rule count plus available type, hook, priority, and policy metadata.
+
+Chain actions are available when the Chains pane is focused. Press `a` to create a regular or base chain, `e` to rename a chain or change a base-chain policy, `X` to flush all rules while keeping the chain, and `x` to delete it. Creation supports type, hook, priority, policy, and the device required by netdev ingress/egress chains. Type, hook, priority, and device are intentionally immutable in the editor because changing a chain's topology requires rebuilding it; AEGIS does not silently destroy and recreate a live chain. Flush and delete always require confirmation, and deletion performs its flush and removal in one nft transaction.
 
 Rule forms use modal Vim controls: Normal mode navigates fields with `j`/`k`, Insert mode edits text after `i`, and Visual mode selects text after `v`. Use `Esc` to return to Normal and `Enter` in Normal to review. From any main workspace, `:!command` runs a non-interactive shell command with AEGIS's current privileges and displays its captured output; commands are terminated after 30 seconds.
 
