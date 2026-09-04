@@ -614,7 +614,7 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+pub(crate) fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width.saturating_sub(4)).max(1);
     let height = height.min(area.height.saturating_sub(2)).max(1);
     Rect::new(
@@ -623,6 +623,11 @@ fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     )
+}
+
+pub(crate) fn horizontal_field_scroll(field: &TextField, width: u16) -> u16 {
+    let visible_width = width.saturating_sub(3) as usize;
+    field.cursor.saturating_sub(visible_width) as u16
 }
 
 pub(crate) fn draw_error_modal(f: &mut ratatui::Frame, app: &App) {

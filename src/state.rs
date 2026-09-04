@@ -222,7 +222,9 @@ impl RuleForm {
         form.family = TextField::from(&rule.family);
         form.table = TextField::from(&rule.table);
         form.chain = TextField::from(&rule.chain);
-        form.statement = TextField::from(rule.exact_expression.as_deref().unwrap_or(""));
+        form.statement = TextField::from(&crate::rules::editable_expression(
+            rule.exact_expression.as_deref().unwrap_or(""),
+        ));
         form.location_locked = true;
         form.structured = vec![
             TextField::from(&rule.family),
@@ -249,10 +251,18 @@ impl RuleForm {
         form
     }
     pub(crate) fn next_field(&mut self) {
+        if self.advanced && self.location_locked {
+            self.field_idx = 3;
+            return;
+        }
         let max = if self.advanced { 4 } else { 16 };
         self.field_idx = (self.field_idx + 1) % max;
     }
     pub(crate) fn prev_field(&mut self) {
+        if self.advanced && self.location_locked {
+            self.field_idx = 3;
+            return;
+        }
         let max = if self.advanced { 4 } else { 16 };
         self.field_idx = if self.field_idx == 0 {
             max - 1

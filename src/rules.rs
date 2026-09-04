@@ -209,6 +209,75 @@ pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+pub(crate) fn editable_expression(expression: &str) -> String {
+    #[derive(Clone, Copy)]
+    struct Token {
+        start: usize,
+        end: usize,
+        quoted: bool,
+    }
+
+    let bytes = expression.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let start = index;
+        let quoted = bytes[index] == b'"';
+        if quoted {
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == b'"' {
+                    index += 1;
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+        } else {
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+        }
+        tokens.push(Token {
+            start,
+            end: index,
+            quoted,
+        });
+    }
+
+    let text = |token: Token| &expression[token.start..token.end];
+    let mut sanitized = String::with_capacity(expression.len());
+    let mut copied_until = 0;
+    let mut token_index = 0;
+    while token_index + 4 < tokens.len() {
+        let sequence = &tokens[token_index..token_index + 5];
+        let is_runtime_counter = sequence.iter().all(|token| !token.quoted)
+            && text(sequence[0]) == "counter"
+            && text(sequence[1]) == "packets"
+            && text(sequence[2]).parse::<u64>().is_ok()
+            && text(sequence[3]) == "bytes"
+            && text(sequence[4]).parse::<u64>().is_ok();
+        if is_runtime_counter {
+            sanitized.push_str(&expression[copied_until..sequence[0].start]);
+            sanitized.push_str("counter");
+            copied_until = sequence[4].end;
+            token_index += 5;
+        } else {
+            token_index += 1;
+        }
+    }
+    sanitized.push_str(&expression[copied_until..]);
+    sanitized
+}
+
 fn describe_operand(op: &Value) -> String {
     if let Some(payload) = op.get("payload") {
         let proto = payload
@@ -601,6 +670,22 @@ table inet pintech {
         assert_eq!(
             rules.get(&("inet".into(), "pintech".into(), "input".into(), 7)),
             Some(&"ct state established,related accept".into())
+        );
+    }
+
+    #[test]
+    fn removes_runtime_counter_values_from_editable_statements() {
+        assert_eq!(
+            editable_expression(
+                "tcp dport 18291 counter packets 91 bytes 5684 dnat to 192.168.122.9:8291"
+            ),
+            "tcp dport 18291 counter dnat to 192.168.122.9:8291"
+        );
+        assert_eq!(
+            editable_expression(
+                "accept comment \"keep  counter packets 91 bytes 5684  text exactly\""
+            ),
+            "accept comment \"keep  counter packets 91 bytes 5684  text exactly\""
         );
     }
 }

@@ -247,19 +247,24 @@ async fn main() -> Result<()> {
 
             match app.mode {
                 Mode::Add | Mode::Insert | Mode::Edit => {
-                    let area = centered_rect(if app.form.advanced { 60 } else { 78 }, if app.form.advanced { 45 } else { 82 }, f.size());
+                    let area = if app.form.advanced {
+                        centered_fixed(112, 20, f.size())
+                    } else {
+                        centered_rect(78, 82, f.size())
+                    };
                     f.render_widget(Clear, area);
 
                     let title = match app.mode {
                         Mode::Add => " Add Rule (Append) ",
                         Mode::Insert => " Insert Rule (Before Selected) ",
-                        _ if app.form.unsupported => " Edit Rule (Advanced: unsupported expressions) ",
+                        _ if app.form.unsupported => " Edit Rule · Advanced nft syntax ",
                         _ => " Edit/Replace Rule ",
                     };
 
                     let modal_block = Block::default()
                         .title(title)
                         .borders(Borders::ALL)
+                        .style(Style::default().bg(MODAL))
                         .border_style(Style::default().fg(ACTIVE));
                     f.render_widget(modal_block, area);
 
@@ -296,14 +301,15 @@ async fn main() -> Result<()> {
                             Constraint::Length(3),
                             Constraint::Length(3),
                             Constraint::Length(3),
+                            Constraint::Length(2),
                         ])
                         .split(area);
 
                     let fields = [
-                        ("Family", &app.form.family),
-                        ("Table", &app.form.table),
-                        ("Chain", &app.form.chain),
-                        ("Rule Expression (e.g., 'tcp dport 80 accept')", &app.form.statement),
+                        (if app.form.location_locked { "Family · read-only" } else { "Family" }, &app.form.family),
+                        (if app.form.location_locked { "Table · read-only" } else { "Table" }, &app.form.table),
+                        (if app.form.location_locked { "Chain · read-only" } else { "Chain" }, &app.form.chain),
+                        ("Exact rule expression", &app.form.statement),
                     ];
 
                     for (idx, (label, field)) in fields.iter().enumerate() {
@@ -311,10 +317,23 @@ async fn main() -> Result<()> {
                         let field_block = Block::default()
                             .borders(Borders::ALL)
                             .title(format!(" {} ", label))
+                            .style(Style::default().bg(MODAL))
                             .border_style(Style::default().fg(border_color));
-
-                        f.render_widget(Paragraph::new(field.value.as_str()).block(field_block), inner_layout[idx]);
+                        let scroll = horizontal_field_scroll(field, inner_layout[idx].width);
+                        f.render_widget(
+                            Paragraph::new(field.value.as_str())
+                                .scroll((0, scroll))
+                                .block(field_block),
+                            inner_layout[idx],
+                        );
                     }
+
+                    f.render_widget(
+                        Paragraph::new("[Enter] Review change   [Esc] Cancel   Edit the expression using nft syntax")
+                            .style(Style::default().fg(MUTED).bg(MODAL))
+                            .alignment(Alignment::Center),
+                        inner_layout[4],
+                    );
 
                     let active_area = inner_layout[app.form.field_idx];
                     let active_field = match app.form.field_idx {
@@ -323,8 +342,11 @@ async fn main() -> Result<()> {
                         2 => &app.form.chain,
                         _ => &app.form.statement,
                     };
+                    let scroll = horizontal_field_scroll(active_field, active_area.width);
                     let max_x = active_area.x + active_area.width.saturating_sub(2);
-                    let cursor_x = (active_area.x + 1 + active_field.cursor as u16).min(max_x);
+                    let cursor_x = (active_area.x + 1 + active_field.cursor as u16)
+                        .saturating_sub(scroll)
+                        .min(max_x);
                     f.set_cursor(cursor_x, active_area.y + 1);
                     }
                 }
