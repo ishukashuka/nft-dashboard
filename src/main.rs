@@ -851,17 +851,29 @@ async fn main() -> Result<()> {
                                 Focus::Table => Focus::Sidebar,
                             };
                         }
-                        KeyCode::Char('j') | KeyCode::Down => app.next(),
-                        KeyCode::Char('k') | KeyCode::Up => app.previous(),
-                        KeyCode::Char('g') if app.pending_g => { app.go_first(); app.pending_g = false; },
-                        KeyCode::Char('g') => app.pending_g = true,
-                        KeyCode::Char('G') => app.go_last(),
                         KeyCode::Char('K') => {
+                            prepare_rule_move(&mut app, RuleMoveDirection::Up)
+                        }
+                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            prepare_rule_move(&mut app, RuleMoveDirection::Up)
+                        }
+                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             prepare_rule_move(&mut app, RuleMoveDirection::Up)
                         }
                         KeyCode::Char('J') => {
                             prepare_rule_move(&mut app, RuleMoveDirection::Down)
                         }
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            prepare_rule_move(&mut app, RuleMoveDirection::Down)
+                        }
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            prepare_rule_move(&mut app, RuleMoveDirection::Down)
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => app.next(),
+                        KeyCode::Char('k') | KeyCode::Up => app.previous(),
+                        KeyCode::Char('g') if app.pending_g => { app.go_first(); app.pending_g = false; },
+                        KeyCode::Char('g') => app.pending_g = true,
+                        KeyCode::Char('G') => app.go_last(),
                         KeyCode::Char('a') if app.focus == Focus::Chains => {
                             if let Some(table) = app.selected_firewall_table() {
                                 app.chain_form = Some(ChainForm::new(&table.family, &table.name));
