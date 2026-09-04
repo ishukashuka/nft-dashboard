@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
             }
 
             let footer_text = match app.mode {
-                Mode::Normal => " j/k Move  Enter Inspect  a Add  e Edit  x Del  ? Keys ",
+                Mode::Normal => " j/k Move  gg/G First/Last  Enter Inspect  a Add  e Edit  x Del  ? Keys ",
                 Mode::Add | Mode::Insert | Mode::Edit => " Tab Field  j/k Select  Space Toggle  F4 Advanced  Enter Review  Esc Cancel ",
                 Mode::ConfirmDelete => " [y] Confirm Delete | [n/Esc] Cancel ",
                 Mode::Filter => " Filter: ",
@@ -347,15 +347,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Mode::Error => {
-                    let area = centered_rect(60, 40, f.size());
-                    f.render_widget(Clear, area);
-                    let p = Paragraph::new(app.error_msg.as_str()).wrap(Wrap { trim: true }).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Command Error ")
-                            .border_style(Style::default().fg(Color::Red)),
-                    );
-                    f.render_widget(p, area);
+                    draw_error_modal(f, &app);
                 }
                 Mode::Help => draw_help_modal(f, &app),
                 Mode::Filter => {}
@@ -400,6 +392,9 @@ async fn main() -> Result<()> {
         tokio::select! {
             Some(key) = rx.recv() => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { break; }
+                if key.code != KeyCode::Char('g') {
+                    app.pending_g = false;
+                }
                 let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort);
                 if key.code == KeyCode::F(1) && !section_switch_owned {
                     open_firewall(&mut app).await;
@@ -407,7 +402,7 @@ async fn main() -> Result<()> {
                 }
                 if key.code == KeyCode::F(2) && !section_switch_owned {
                     match network::load_profiles().await {
-                        Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.section = Section::Network; app.mode = Mode::Normal; app.network_focus = true; app.error_msg.clear(); app.status_msg = "Network loaded".into(); }
+                        Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.repair_network_selection(); app.section = Section::Network; app.mode = Mode::Normal; app.network_focus = true; app.error_msg.clear(); app.status_msg = "Network loaded".into(); }
                         Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; }
                     }
                     continue;
@@ -437,10 +432,13 @@ async fn main() -> Result<()> {
                         KeyCode::Char('l') | KeyCode::Right => { app.socket_tab = app.socket_tab.next(); app.socket_selected = 0; match sockets::client::load(app.socket_tab == SocketTab::Listening).await { Ok(entries) => app.replace_sockets(entries), Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } } },
                         KeyCode::Char('j') | KeyCode::Down => { if !app.socket_visible.is_empty() { app.socket_selected = (app.socket_selected + 1).min(app.socket_visible.len() - 1); } },
                         KeyCode::Char('k') | KeyCode::Up => app.socket_selected = app.socket_selected.saturating_sub(1),
+                        KeyCode::Char('g') if app.pending_g => { app.socket_selected = 0; app.pending_g = false; },
+                        KeyCode::Char('g') => app.pending_g = true,
+                        KeyCode::Char('G') => app.socket_selected = app.socket_visible.len().saturating_sub(1),
                         KeyCode::Enter => if app.selected_socket().is_some() { app.socket_inspector_tab = SocketInspectorTab::Details; app.detail_scroll = 0; app.mode = Mode::Detail; },
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('r') => match sockets::client::load(app.socket_tab == SocketTab::Listening).await { Ok(entries) => { app.replace_sockets(entries); app.status_msg = "Ports refreshed".into(); }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } },
-                        KeyCode::Char('?') => { app.error_msg = "F1 Firewall · F2 Network · F3 Ports\nh/l switches Listening and Connections · j/k selects · Enter inspects · / filters · r refreshes · Esc goes back · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "F1 Firewall · F2 Network · F3 Ports\nh/l switches Listening and Connections · j/k selects · gg/G jumps first/last · Enter inspects · / filters · r refreshes · Esc goes back · q quits".into(); app.mode = Mode::Help; },
                         _ => {}
                     }
                     continue;
@@ -494,7 +492,7 @@ async fn main() -> Result<()> {
                         Mode::NetworkConfirm => match key.code {
                             KeyCode::Esc | KeyCode::Char('n') => { app.network_form = None; app.mode = Mode::Normal; }
                             KeyCode::Char('y') => {
-                                let result = if let (Some(profile), Some(form)) = (app.profiles.get(app.network_selected).cloned(), app.network_form.as_ref()) {
+                                let result = if let (Some(profile), Some(form)) = (app.selected_network_profile().cloned(), app.network_form.as_ref()) {
                                     let values: Vec<String> = form.fields.iter().map(|f| f.value.trim().to_string()).collect();
                                     if app.network_action.starts_with("delete") { if let Some(route) = profile.routes.get(app.network_route_selected) { network::remove_route(&profile, route).await } else { Ok(()) } }
                                     else if form.title == "General configuration" { network::save_autoconnect(&profile, &values[0]).await }
@@ -502,8 +500,20 @@ async fn main() -> Result<()> {
                                     else if form.title == "DNS configuration" { network::save_dns(&profile, &values[0], &values[1]).await }
                                     else { let route = network::Route { destination: values[0].clone(), gateway: values[1].clone(), metric: values[2].clone() }; let old = if form.title.starts_with("Edit persistent route") { profile.routes.get(app.network_route_selected) } else { None }; network::save_route(&profile, old, &route).await }
                                 } else { Ok(()) };
-                                match result { Ok(()) => match network::load_profiles().await { Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.status_msg = "Persistent network configuration updated".into(); app.network_form = None; app.mode = Mode::Normal; }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } }
+                                match result { Ok(()) => match network::load_profiles().await { Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.repair_network_selection(); app.status_msg = "Persistent network configuration updated".into(); app.network_form = None; app.mode = Mode::Normal; }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } }
                             }
+                            _ => {}
+                        },
+                        Mode::Filter => match key.code {
+                            KeyCode::Esc => { app.network_filter.clear(); app.repair_network_selection(); app.mode = Mode::Normal; },
+                            KeyCode::Enter => app.mode = Mode::Normal,
+                            KeyCode::Left => app.network_filter.left(),
+                            KeyCode::Right => app.network_filter.right(),
+                            KeyCode::Home => app.network_filter.home(),
+                            KeyCode::End => app.network_filter.end(),
+                            KeyCode::Backspace => { app.network_filter.backspace(); app.repair_network_selection(); },
+                            KeyCode::Delete => { app.network_filter.delete(); app.repair_network_selection(); },
+                            KeyCode::Char(c) => { app.network_filter.insert(c); app.repair_network_selection(); },
                             _ => {}
                         },
                         Mode::Error | Mode::Help => if matches!(key.code, KeyCode::Esc | KeyCode::Enter) { app.error_msg.clear(); app.mode = Mode::Normal; },
@@ -516,18 +526,27 @@ async fn main() -> Result<()> {
                         KeyCode::Esc => { open_firewall(&mut app).await; },
                         KeyCode::Char('q') => break,
                         KeyCode::Tab => app.network_focus = !app.network_focus,
-                            KeyCode::Char('j') | KeyCode::Down if app.network_focus => { if !app.profiles.is_empty() { app.network_selected = (app.network_selected + 1).min(app.profiles.len() - 1); app.network_route_selected = 0; } },
-                            KeyCode::Char('k') | KeyCode::Up if app.network_focus => { app.network_selected = app.network_selected.saturating_sub(1); app.network_route_selected = 0; },
-                            KeyCode::Char('j') | KeyCode::Down if app.network_tab == NetworkTab::Routes => if let Some(p) = app.profiles.get(app.network_selected) { app.network_route_selected = (app.network_route_selected + 1).min(p.routes.len().saturating_sub(1)); },
+                            KeyCode::Char('j') | KeyCode::Down if app.network_focus => app.move_network_selection(1),
+                            KeyCode::Char('k') | KeyCode::Up if app.network_focus => app.move_network_selection(-1),
+                            KeyCode::Char('j') | KeyCode::Down if app.network_tab == NetworkTab::Routes => if let Some(p) = app.selected_network_profile() { app.network_route_selected = (app.network_route_selected + 1).min(p.routes.len().saturating_sub(1)); },
                             KeyCode::Char('k') | KeyCode::Up if app.network_tab == NetworkTab::Routes => app.network_route_selected = app.network_route_selected.saturating_sub(1),
+                        KeyCode::Char('g') if app.pending_g => {
+                            if app.network_focus { app.go_first_network_profile(); } else if app.network_tab == NetworkTab::Routes { app.network_route_selected = 0; }
+                            app.pending_g = false;
+                        },
+                        KeyCode::Char('g') => app.pending_g = true,
+                        KeyCode::Char('G') => {
+                            if app.network_focus { app.go_last_network_profile(); } else if app.network_tab == NetworkTab::Routes { if let Some(p) = app.selected_network_profile() { app.network_route_selected = p.routes.len().saturating_sub(1); } }
+                        },
                         KeyCode::Char('h') | KeyCode::Left if !app.network_focus => app.network_tab = app.network_tab.previous(),
                         KeyCode::Char('l') | KeyCode::Right if !app.network_focus => app.network_tab = app.network_tab.next(),
-                        KeyCode::Char('r') => match network::load_profiles().await { Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.status_msg = "Network refreshed".into(); }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } },
+                        KeyCode::Char('r') => match network::load_profiles().await { Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.repair_network_selection(); app.status_msg = "Network refreshed".into(); }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } },
+                        KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('f') => { open_firewall(&mut app).await; },
-                        KeyCode::Char('e') => if let Some(p) = app.profiles.get(app.network_selected) { app.network_form = Some(match app.network_tab { NetworkTab::General => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.autoconnect)], title: "General configuration".into() }, NetworkTab::Ipv4 => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.ipv4_method), TextField::from(&p.addresses.join(", ")), TextField::from(&p.gateway), TextField::from(&p.metric)], title: "IPv4 configuration".into() }, NetworkTab::Dns => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.dns.join(", ")), TextField::from(&p.search.join(", "))], title: "DNS configuration".into() }, NetworkTab::Routes => if let Some(route) = p.routes.get(app.network_route_selected) { NetworkForm { field_idx: 0, fields: vec![TextField::from(&route.destination), TextField::from(&route.gateway), TextField::from(&route.metric)], title: "Edit persistent route".into() } } else { NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() } } }); app.network_action = if app.network_tab == NetworkTab::Routes { "edit persistent route".into() } else { "Review the persistent change".into() }; app.mode = Mode::NetworkEdit; },
-                        KeyCode::Char('a') if app.network_tab == NetworkTab::Routes => if app.profiles.get(app.network_selected).is_some() { app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() }); app.network_action = "Review adding this persistent route".into(); app.mode = Mode::NetworkEdit; },
-                        KeyCode::Char('d') if app.network_tab == NetworkTab::Routes => if let Some(p) = app.profiles.get(app.network_selected) { if let Some(route) = p.routes.get(app.network_route_selected) { app.network_action = format!("delete route {} via {}", route.destination, route.gateway); app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default()], title: "Delete persistent route".into() }); app.mode = Mode::NetworkConfirm; } },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · h/l switches tabs · j/k selects profiles or routes · e edits autoconnect, IPv4, DNS, or routes · a adds a route · d removes a route · r refreshes · f returns to Firewall · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('e') => if let Some(p) = app.selected_network_profile() { app.network_form = Some(match app.network_tab { NetworkTab::General => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.autoconnect)], title: "General configuration".into() }, NetworkTab::Ipv4 => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.ipv4_method), TextField::from(&p.addresses.join(", ")), TextField::from(&p.gateway), TextField::from(&p.metric)], title: "IPv4 configuration".into() }, NetworkTab::Dns => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.dns.join(", ")), TextField::from(&p.search.join(", "))], title: "DNS configuration".into() }, NetworkTab::Routes => if let Some(route) = p.routes.get(app.network_route_selected) { NetworkForm { field_idx: 0, fields: vec![TextField::from(&route.destination), TextField::from(&route.gateway), TextField::from(&route.metric)], title: "Edit persistent route".into() } } else { NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() } } }); app.network_action = if app.network_tab == NetworkTab::Routes { "edit persistent route".into() } else { "Review the persistent change".into() }; app.mode = Mode::NetworkEdit; },
+                        KeyCode::Char('a') if app.network_tab == NetworkTab::Routes => if app.selected_network_profile().is_some() { app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() }); app.network_action = "Review adding this persistent route".into(); app.mode = Mode::NetworkEdit; },
+                        KeyCode::Char('d') if app.network_tab == NetworkTab::Routes => if let Some(p) = app.selected_network_profile() { if let Some(route) = p.routes.get(app.network_route_selected) { app.network_action = format!("delete route {} via {}", route.destination, route.gateway); app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default()], title: "Delete persistent route".into() }); app.mode = Mode::NetworkConfirm; } },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · h/l switches tabs · j/k selects profiles or routes · gg/G jumps first/last · / filters profiles · e edits autoconnect, IPv4, DNS, or routes · a adds a route · d removes a route · r refreshes · f returns to Firewall · q quits".into(); app.mode = Mode::Help; },
                         _ => {}
                     }
                     continue;
@@ -543,6 +562,9 @@ async fn main() -> Result<()> {
                         }
                         KeyCode::Char('j') | KeyCode::Down => app.next(),
                         KeyCode::Char('k') | KeyCode::Up => app.previous(),
+                        KeyCode::Char('g') if app.pending_g => { app.go_first(); app.pending_g = false; },
+                        KeyCode::Char('g') => app.pending_g = true,
+                        KeyCode::Char('G') => app.go_last(),
                         KeyCode::Char('a') => {
                             app.form = RuleForm::new();
                             app.pending_operation = RuleOperation::Add;
@@ -560,8 +582,8 @@ async fn main() -> Result<()> {
                         KeyCode::Char('e') => {
                             if let Some(rule) = app.selected_rule() {
                                 let form = RuleForm::from_rule(rule);
-                                if form.unsupported {
-                                    app.error_msg = "This rule contains expressions the structured editor cannot safely round-trip. Inspect its Raw AST and edit it with nft directly.".into();
+                                if form.unsupported && form.statement.value.is_empty() {
+                                    app.error_msg = "This rule contains expressions the structured editor cannot safely round-trip, and its exact nft statement was unavailable. Refresh and try again, or inspect its Raw AST before editing it with nft directly.".into();
                                     app.mode = Mode::Error;
                                 } else {
                                     app.form = form;
@@ -581,13 +603,13 @@ async fn main() -> Result<()> {
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('s') => app.mode = Mode::Sort,
                         KeyCode::Char('S') => { app.sort_reverse = !app.sort_reverse; app.recompute_visible(); },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · j/k navigates · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches pane · j/k navigates · gg/G jumps first/last · a appends · i inserts · e edits · x deletes · Enter inspects · / filters · s sorts · r refreshes · F1/F2/F3 changes section · q quits".into(); app.mode = Mode::Help; },
                         KeyCode::Char('r') => match fetch_ruleset().await {
                             Ok(r) => { app.rules = r; app.update_sidebar(); app.recompute_visible(); app.status_msg = "Refreshed".to_string(); }
                             Err(e) => app.status_msg = format!("Refresh failed: {}", e),
                         },
                         KeyCode::Char('n') => match network::load_profiles().await {
-                            Ok(p) => { app.profiles = p; app.network_selected = 0; app.section = Section::Network; app.network_focus = true; app.status_msg = "Network loaded".into(); }
+                            Ok(p) => { app.profiles = p; app.network_selected = 0; app.repair_network_selection(); app.section = Section::Network; app.network_focus = true; app.status_msg = "Network loaded".into(); }
                             Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; }
                         },
                         _ => {}

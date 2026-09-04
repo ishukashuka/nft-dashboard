@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use ratatui::style::Color;
 use serde_json::Value;
+use std::collections::HashMap;
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11,6 +12,7 @@ pub(crate) enum Verdict {
     Jump,
     Return,
     Continue,
+    Translate,
     Other,
 }
 
@@ -20,6 +22,7 @@ impl Verdict {
             Verdict::Accept => Color::Green,
             Verdict::Drop | Verdict::Reject => Color::Red,
             Verdict::Jump | Verdict::Return | Verdict::Continue => Color::Blue,
+            Verdict::Translate => Color::Magenta,
             Verdict::Other => Color::Gray,
         }
     }
@@ -97,6 +100,7 @@ pub(crate) struct Rule {
     pub(crate) handle: u64,
     pub(crate) parsed: ParsedRuleExpr,
     pub(crate) expression: String,
+    pub(crate) exact_expression: Option<String>,
     pub(crate) verdict: Verdict,
     pub(crate) raw: Value,
     pub(crate) comment: Option<String>,
@@ -167,7 +171,15 @@ impl Rule {
             }
         }
         lines.push(String::new());
-        lines.push(format!("Reconstructed nft statement: {}", self.expression));
+        lines.push(format!(
+            "{} nft statement: {}",
+            if self.exact_expression.is_some() {
+                "Exact"
+            } else {
+                "Reconstructed"
+            },
+            self.expression
+        ));
         lines.push(String::new());
         lines.push(format!("Explanation: {}", self.explanation()));
         lines
@@ -219,6 +231,14 @@ fn describe_operand(op: &Value) -> String {
         let len = prefix.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
         return format!("{}/{}", addr, len);
     }
+    if let Some(range) = op.get("range").and_then(Value::as_array) {
+        let bounds = range.iter().map(describe_operand).collect::<Vec<_>>();
+        return bounds.join("-");
+    }
+    if let Some(set) = op.get("set").and_then(Value::as_array) {
+        let values = set.iter().map(describe_operand).collect::<Vec<_>>();
+        return format!("{{{}}}", values.join(", "));
+    }
     if let Some(s) = op.as_str() {
         return s.to_string();
     }
@@ -230,6 +250,26 @@ fn describe_operand(op: &Value) -> String {
         return format!("{{{}}}", parts.join(", "));
     }
     serde_json::to_string(op).unwrap_or_default()
+}
+
+fn describe_nat_action(name: &str, value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return name.to_string();
+    };
+    let address = object.get("addr").map(describe_operand).unwrap_or_default();
+    let port = object.get("port").map(describe_operand).unwrap_or_default();
+    let target = match (address.is_empty(), port.is_empty()) {
+        (false, false) if address.contains(':') => format!("[{}]:{}", address, port),
+        (false, false) => format!("{}:{}", address, port),
+        (false, true) => address,
+        (true, false) => format!(":{}", port),
+        (true, true) => String::new(),
+    };
+    if target.is_empty() {
+        name.to_string()
+    } else {
+        format!("{} to {}", name, target)
+    }
 }
 
 fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
@@ -301,6 +341,22 @@ fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
             action = format!("goto {}", target);
             raw_parts.push(action.clone());
             verdict = Verdict::Jump;
+        } else if let Some(value) = item.get("dnat") {
+            action = describe_nat_action("dnat", value);
+            raw_parts.push(action.clone());
+            verdict = Verdict::Translate;
+        } else if let Some(value) = item.get("snat") {
+            action = describe_nat_action("snat", value);
+            raw_parts.push(action.clone());
+            verdict = Verdict::Translate;
+        } else if let Some(value) = item.get("redirect") {
+            action = describe_nat_action("redirect", value);
+            raw_parts.push(action.clone());
+            verdict = Verdict::Translate;
+        } else if item.get("masquerade").is_some() {
+            action = "masquerade".to_string();
+            raw_parts.push(action.clone());
+            verdict = Verdict::Translate;
         } else if item.get("log").is_some() {
             raw_parts.push("log".to_string());
         } else if let Some(c) = item.get("counter") {
@@ -350,6 +406,71 @@ fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
     (parsed, raw_str, verdict)
 }
 
+type RuleKey = (String, String, String, u64);
+
+fn parse_text_ruleset(output: &str) -> HashMap<RuleKey, String> {
+    let mut rules = HashMap::new();
+    let mut family = String::new();
+    let mut table = String::new();
+    let mut chain = String::new();
+    let mut depth = 0usize;
+    let mut table_depth = None;
+    let mut chain_depth = None;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if let Some(header) = line.strip_prefix("table ") {
+            let mut words = header.split_whitespace();
+            family = words.next().unwrap_or_default().trim_matches('"').into();
+            table = words.next().unwrap_or_default().trim_matches('"').into();
+            chain.clear();
+            table_depth = Some(depth + 1);
+        } else if let Some(header) = line.strip_prefix("chain ") {
+            chain = header
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .into();
+            chain_depth = Some(depth + 1);
+        }
+
+        if let Some((statement, handle_text)) = line.rsplit_once("# handle ") {
+            if let Some(handle) = handle_text
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                let statement = statement.trim();
+                if !family.is_empty()
+                    && !table.is_empty()
+                    && !chain.is_empty()
+                    && !statement.is_empty()
+                {
+                    rules.insert(
+                        (family.clone(), table.clone(), chain.clone(), handle),
+                        statement.to_string(),
+                    );
+                }
+            }
+        }
+
+        depth = depth
+            .saturating_add(line.matches('{').count())
+            .saturating_sub(line.matches('}').count());
+        if chain_depth.is_some_and(|scope_depth| depth < scope_depth) {
+            chain.clear();
+            chain_depth = None;
+        }
+        if table_depth.is_some_and(|scope_depth| depth < scope_depth) {
+            family.clear();
+            table.clear();
+            table_depth = None;
+        }
+    }
+    rules
+}
+
 pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
     let output = Command::new("nft")
         .args(["--json", "list", "ruleset"])
@@ -364,6 +485,16 @@ pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
     }
 
     let root: Value = serde_json::from_slice(&output.stdout)?;
+    let exact_rules = match Command::new("nft")
+        .args(["-a", "list", "ruleset"])
+        .output()
+        .await
+    {
+        Ok(text_output) if text_output.status.success() => {
+            parse_text_ruleset(&String::from_utf8_lossy(&text_output.stdout))
+        }
+        _ => HashMap::new(),
+    };
     let mut rules = Vec::new();
 
     if let Some(nftables) = root.get("nftables").and_then(|v| v.as_array()) {
@@ -387,7 +518,7 @@ pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
                 let handle = rule.get("handle").and_then(|v| v.as_u64()).unwrap_or(0);
                 let expr_val = rule.get("expr").cloned().unwrap_or(Value::Array(vec![]));
 
-                let (parsed, expression, verdict) = match expr_val.as_array() {
+                let (parsed, reconstructed_expression, verdict) = match expr_val.as_array() {
                     Some(arr) => parse_expr_structured(arr),
                     None => (
                         ParsedRuleExpr::default(),
@@ -396,6 +527,11 @@ pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
                     ),
                 };
 
+                let exact_expression = exact_rules
+                    .get(&(family.clone(), table.clone(), chain.clone(), handle))
+                    .cloned();
+                let expression = exact_expression.clone().unwrap_or(reconstructed_expression);
+
                 rules.push(Rule {
                     family,
                     table,
@@ -403,6 +539,7 @@ pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
                     handle,
                     parsed,
                     expression,
+                    exact_expression,
                     verdict,
                     raw: expr_val,
                     comment: rule
@@ -414,4 +551,56 @@ pub(crate) async fn fetch_ruleset() -> Result<Vec<Rule>> {
         }
     }
     Ok(rules)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_ranges_and_nat_actions() {
+        let expression = vec![
+            serde_json::json!({
+                "match": {
+                    "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                    "op": "==",
+                    "right": {"range": [8000, 8005]}
+                }
+            }),
+            serde_json::json!({"dnat": {"addr": "172.17.0.2", "port": 80}}),
+        ];
+        let (parsed, statement, verdict) = parse_expr_structured(&expression);
+        assert_eq!(parsed.proto_port, "tcp dport 8000-8005");
+        assert_eq!(parsed.action, "dnat to 172.17.0.2:80");
+        assert!(statement.contains("tcp dport 8000-8005"));
+        assert_eq!(verdict, Verdict::Translate);
+    }
+
+    #[test]
+    fn parses_exact_statements_by_rule_handle() {
+        let output = r#"
+table ip nat {
+    set docker_ports {
+        type inet_service
+    }
+    chain PREROUTING {
+        tcp dport 8000-8005 dnat to 172.17.0.2:80 # handle 14
+    }
+}
+table inet pintech {
+    chain input {
+        ct state established,related accept # handle 7
+    }
+}
+"#;
+        let rules = parse_text_ruleset(output);
+        assert_eq!(
+            rules.get(&("ip".into(), "nat".into(), "PREROUTING".into(), 14)),
+            Some(&"tcp dport 8000-8005 dnat to 172.17.0.2:80".into())
+        );
+        assert_eq!(
+            rules.get(&("inet".into(), "pintech".into(), "input".into(), 7)),
+            Some(&"ct state established,related accept".into())
+        );
+    }
 }

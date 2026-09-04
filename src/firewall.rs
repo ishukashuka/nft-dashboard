@@ -232,6 +232,15 @@ fn describe(value: &Value) -> String {
         let length = prefix.get("len").and_then(Value::as_u64).unwrap_or(0);
         return format!("{address}/{length}");
     }
+    if let Some(range) = value.get("range").and_then(Value::as_array) {
+        return range.iter().map(describe).collect::<Vec<_>>().join("-");
+    }
+    if let Some(set) = value.get("set").and_then(Value::as_array) {
+        return format!(
+            "{{{}}}",
+            set.iter().map(describe).collect::<Vec<_>>().join(", ")
+        );
+    }
     if let Some(s) = value.as_str() {
         return s.into();
     }

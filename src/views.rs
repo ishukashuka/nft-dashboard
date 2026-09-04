@@ -2,6 +2,7 @@ use crate::*;
 use ratatui::text::{Line, Span};
 
 pub(crate) const CANVAS: Color = Color::Rgb(8, 15, 28);
+pub(crate) const MODAL: Color = Color::Rgb(13, 23, 38);
 pub(crate) const SELECTED: Color = Color::Rgb(29, 55, 82);
 pub(crate) const ACCENT: Color = Color::Rgb(44, 211, 225);
 pub(crate) const ACTIVE: Color = Color::Rgb(255, 190, 72);
@@ -196,13 +197,18 @@ pub(crate) fn draw_ports(f: &mut ratatui::Frame, app: &App) {
         state.select(Some(app.socket_selected));
         f.render_stateful_widget(table, pane[1], &mut state);
     }
-    let footer = if app.mode == Mode::Filter {
-        " Type to filter sockets  [Enter] Keep  [Esc] Clear "
+    let footer: String = if app.mode == Mode::Filter {
+        format!(
+            " Filter: {}  [Enter] Keep  [Esc] Clear ",
+            app.socket_filter.value
+        )
     } else if app.mode == Mode::Detail {
-        " h/l Tab  j/k Scroll  Esc Back  ? Keys "
+        " h/l Tab  j/k Scroll  Esc Back  ? Keys ".into()
     } else {
-        " h/l Tab  j/k Move  Enter Inspect  / Filter  r Refresh  ? Keys  q Quit "
+        " h/l Tab  j/k Move  gg/G First/Last  Enter Inspect  / Filter  r Refresh  ? Keys  q Quit "
+            .into()
     };
+    let footer_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
     f.render_widget(
         Paragraph::new(footer).block(
             Block::default()
@@ -211,6 +217,13 @@ pub(crate) fn draw_ports(f: &mut ratatui::Frame, app: &App) {
         ),
         chunks[2],
     );
+    if app.mode == Mode::Filter {
+        f.set_cursor(
+            (footer_inner.x + 9 + app.socket_filter.cursor as u16)
+                .min(footer_inner.right().saturating_sub(1)),
+            footer_inner.y,
+        );
+    }
     if app.mode == Mode::Detail {
         if let Some(s) = app.selected_socket() {
             let area = centered_rect(75, 70, f.size());
@@ -252,9 +265,9 @@ pub(crate) fn draw_ports(f: &mut ratatui::Frame, app: &App) {
 }
 
 pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
+    let visible_profiles = app.network_visible_indices();
     let network_location = app
-        .profiles
-        .get(app.network_selected)
+        .selected_network_profile()
         .map(|p| {
             format!(
                 "Network > Connections > {} > {}",
@@ -271,7 +284,22 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
             Constraint::Length(3),
         ])
         .split(f.size());
-    let head = Paragraph::new(navigation(&app.section, network_location.clone())).block(
+    let filter_label = if app.network_filter.value.is_empty() {
+        "none"
+    } else {
+        app.network_filter.value.as_str()
+    };
+    let head = Paragraph::new(navigation(
+        &app.section,
+        format!(
+            "{} · {} of {} profiles · filter {}",
+            network_location,
+            visible_profiles.len(),
+            app.profiles.len(),
+            filter_label
+        ),
+    ))
+    .block(
         Block::default()
             .borders(Borders::ALL)
             .title(" NETWORK / CONNECTION PROFILES ")
@@ -282,9 +310,9 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(chunks[1]);
-    let items = app
-        .profiles
+    let items = visible_profiles
         .iter()
+        .filter_map(|index| app.profiles.get(*index))
         .map(|p| {
             ListItem::new(format!(
                 "{}  {} {}",
@@ -299,8 +327,11 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
         })
         .collect::<Vec<_>>();
     let mut state = ListState::default();
-    if !app.profiles.is_empty() {
-        state.select(Some(app.network_selected.min(app.profiles.len() - 1)));
+    if let Some(position) = visible_profiles
+        .iter()
+        .position(|index| *index == app.network_selected)
+    {
+        state.select(Some(position));
     }
     let list = List::new(items)
         .block(
@@ -316,7 +347,7 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_stateful_widget(list, panes[0], &mut state);
-    if let Some(p) = app.profiles.get(app.network_selected) {
+    if let Some(p) = app.selected_network_profile() {
         let tabs = [
             NetworkTab::General,
             NetworkTab::Ipv4,
@@ -435,19 +466,32 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
             panes[1],
         );
     } else {
+        let empty_message = if app.profiles.is_empty() {
+            "No NetworkManager profiles found\n\nPress r to refresh.".to_string()
+        } else {
+            format!(
+                "No connection profiles match \"{}\".\n\nPress / and Esc to clear the filter.",
+                app.network_filter.value
+            )
+        };
         f.render_widget(
-            Paragraph::new("No NetworkManager profiles found\n\nPress r to refresh.")
+            Paragraph::new(empty_message)
                 .alignment(Alignment::Center)
                 .block(Block::default().borders(Borders::ALL).title(" Details ")),
             panes[1],
         );
     }
-    let footer = match app.mode {
-        Mode::NetworkEdit => " [Tab] Field  [Enter] Review  [Esc] Cancel ",
-        Mode::NetworkConfirm => " [y] Apply  [Esc] Cancel ",
-        Mode::Error => " [Esc] Back  [F1/F2/F3] Section ",
-        _ => " Tab Pane  h/l Tab  j/k Move  e Edit  a Add  d Del  ? Keys  q Quit ",
+    let footer: String = match app.mode {
+        Mode::NetworkEdit => " [Tab] Field  [Enter] Review  [Esc] Cancel ".into(),
+        Mode::NetworkConfirm => " [y] Apply  [Esc] Cancel ".into(),
+        Mode::Error => " [Esc] Back  [F1/F2/F3] Section ".into(),
+        Mode::Filter => format!(
+            " Filter: {}  [Enter] Keep  [Esc] Clear ",
+            app.network_filter.value
+        ),
+        _ => " Tab Pane  h/l Tab  j/k Move  gg/G First/Last  / Filter  e Edit  a Add  d Del  ? Keys  q Quit ".into(),
     };
+    let footer_inner = Block::default().borders(Borders::ALL).inner(chunks[2]);
     f.render_widget(
         Paragraph::new(footer).block(
             Block::default()
@@ -456,6 +500,13 @@ pub(crate) fn draw_network(f: &mut ratatui::Frame, app: &App) {
         ),
         chunks[2],
     );
+    if app.mode == Mode::Filter {
+        f.set_cursor(
+            (footer_inner.x + 9 + app.network_filter.cursor as u16)
+                .min(footer_inner.right().saturating_sub(1)),
+            footer_inner.y,
+        );
+    }
 }
 
 pub(crate) fn draw_network_modal(f: &mut ratatui::Frame, app: &App) {
@@ -563,8 +614,19 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width.saturating_sub(4)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 pub(crate) fn draw_error_modal(f: &mut ratatui::Frame, app: &App) {
-    let area = centered_rect(62, 38, f.size());
+    let area = centered_fixed(96, 9, f.size());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(format!("{}\n\n[Esc/Enter] Dismiss", app.error_msg))
@@ -574,6 +636,7 @@ pub(crate) fn draw_error_modal(f: &mut ratatui::Frame, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" AEGIS · Action failed ")
+                    .style(Style::default().bg(MODAL))
                     .border_style(Style::default().fg(Color::Red)),
             ),
         area,
@@ -581,7 +644,7 @@ pub(crate) fn draw_error_modal(f: &mut ratatui::Frame, app: &App) {
 }
 
 pub(crate) fn draw_help_modal(f: &mut ratatui::Frame, app: &App) {
-    let area = centered_rect(68, 44, f.size());
+    let area = centered_fixed(104, 16, f.size());
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(format!(
@@ -594,6 +657,7 @@ pub(crate) fn draw_help_modal(f: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Help ")
+                .style(Style::default().bg(MODAL))
                 .border_style(Style::default().fg(ACCENT)),
         ),
         area,

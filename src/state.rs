@@ -222,7 +222,7 @@ impl RuleForm {
         form.family = TextField::from(&rule.family);
         form.table = TextField::from(&rule.table);
         form.chain = TextField::from(&rule.chain);
-        form.statement = TextField::from(&rule.expression);
+        form.statement = TextField::from(rule.exact_expression.as_deref().unwrap_or(""));
         form.location_locked = true;
         form.structured = vec![
             TextField::from(&rule.family),
@@ -331,7 +331,9 @@ pub(crate) struct App {
     pub(crate) mode: Mode,
     pub(crate) form: RuleForm,
     pub(crate) filter: TextField,
+    pub(crate) network_filter: TextField,
     pub(crate) socket_filter: TextField,
+    pub(crate) pending_g: bool,
     pub(crate) status_msg: String,
     pub(crate) error_msg: String,
     pub(crate) detail_scroll: u16,
@@ -400,7 +402,9 @@ impl App {
             mode: Mode::Normal,
             form: RuleForm::new(),
             filter: TextField::default(),
+            network_filter: TextField::default(),
             socket_filter: TextField::default(),
+            pending_g: false,
             status_msg: "Ready".to_string(),
             error_msg: String::new(),
             detail_scroll: 0,
@@ -555,6 +559,40 @@ impl App {
         }
     }
 
+    pub(crate) fn go_first(&mut self) {
+        match self.focus {
+            Focus::Sidebar => {
+                if !self.sidebar_items.is_empty() {
+                    self.sidebar_state.select(Some(0));
+                    self.recompute_visible();
+                }
+            }
+            Focus::Table => {
+                if !self.visible.is_empty() {
+                    self.table_state.select(Some(0));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn go_last(&mut self) {
+        match self.focus {
+            Focus::Sidebar => {
+                if !self.sidebar_items.is_empty() {
+                    self.sidebar_state
+                        .select(Some(self.sidebar_items.len().saturating_sub(1)));
+                    self.recompute_visible();
+                }
+            }
+            Focus::Table => {
+                if !self.visible.is_empty() {
+                    self.table_state
+                        .select(Some(self.visible.len().saturating_sub(1)));
+                }
+            }
+        }
+    }
+
     pub(crate) fn selected_rule(&self) -> Option<&Rule> {
         self.table_state
             .selected()
@@ -587,6 +625,84 @@ impl App {
         self.socket_selected = self
             .socket_selected
             .min(self.socket_visible.len().saturating_sub(1));
+    }
+
+    pub(crate) fn network_visible_indices(&self) -> Vec<usize> {
+        let query = self.network_filter.value.trim().to_lowercase();
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| {
+                query.is_empty()
+                    || [
+                        profile.name.as_str(),
+                        profile.kind.as_str(),
+                        profile.device.as_str(),
+                        profile.state.as_str(),
+                        profile.autoconnect.as_str(),
+                        profile.ipv4_method.as_str(),
+                        profile.gateway.as_str(),
+                    ]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&query))
+                    || profile
+                        .addresses
+                        .iter()
+                        .chain(&profile.runtime_addresses)
+                        .chain(&profile.dns)
+                        .chain(&profile.search)
+                        .any(|value| value.to_lowercase().contains(&query))
+                    || profile.routes.iter().any(|route| {
+                        route.destination.to_lowercase().contains(&query)
+                            || route.gateway.to_lowercase().contains(&query)
+                            || route.metric.to_lowercase().contains(&query)
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub(crate) fn repair_network_selection(&mut self) {
+        let visible = self.network_visible_indices();
+        if !visible.is_empty() && !visible.contains(&self.network_selected) {
+            self.network_selected = visible[0];
+            self.network_route_selected = 0;
+        }
+    }
+
+    pub(crate) fn move_network_selection(&mut self, delta: isize) {
+        let visible = self.network_visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        let current = visible
+            .iter()
+            .position(|index| *index == self.network_selected)
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, visible.len() as isize - 1) as usize;
+        self.network_selected = visible[next];
+        self.network_route_selected = 0;
+    }
+
+    pub(crate) fn go_first_network_profile(&mut self) {
+        if let Some(index) = self.network_visible_indices().first() {
+            self.network_selected = *index;
+            self.network_route_selected = 0;
+        }
+    }
+
+    pub(crate) fn go_last_network_profile(&mut self) {
+        if let Some(index) = self.network_visible_indices().last() {
+            self.network_selected = *index;
+            self.network_route_selected = 0;
+        }
+    }
+
+    pub(crate) fn selected_network_profile(&self) -> Option<&network::Profile> {
+        self.network_visible_indices()
+            .contains(&self.network_selected)
+            .then(|| self.profiles.get(self.network_selected))
+            .flatten()
     }
 
     pub(crate) fn replace_sockets(&mut self, entries: Vec<sockets::model::SocketEntry>) {
@@ -666,5 +782,40 @@ mod tests {
     fn counter_parser_handles_the_display_separator() {
         assert_eq!(parse_counter("12p / 4096b"), (12, 4096));
         assert_eq!(parse_counter("-"), (0, 0));
+    }
+
+    #[test]
+    fn network_filter_matches_details_and_repairs_selection() {
+        let mut app = App::new();
+        app.profiles = vec![
+            network::Profile {
+                name: "lan".into(),
+                device: "eth0".into(),
+                ..Default::default()
+            },
+            network::Profile {
+                name: "uplink".into(),
+                device: "wan0".into(),
+                dns: vec!["1.1.1.1".into()],
+                ..Default::default()
+            },
+        ];
+        app.network_filter = TextField::from("1.1.1.1");
+        app.repair_network_selection();
+        assert_eq!(app.network_visible_indices(), vec![1]);
+        assert_eq!(app.network_selected, 1);
+        assert_eq!(app.selected_network_profile().unwrap().name, "uplink");
+    }
+
+    #[test]
+    fn first_and_last_follow_the_focused_firewall_pane() {
+        let mut app = App::new();
+        app.visible = vec![4, 8, 15];
+        app.focus = Focus::Table;
+        app.table_state.select(Some(1));
+        app.go_first();
+        assert_eq!(app.table_state.selected(), Some(0));
+        app.go_last();
+        assert_eq!(app.table_state.selected(), Some(2));
     }
 }
