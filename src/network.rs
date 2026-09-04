@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::net::{IpAddr, Ipv4Addr};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -7,6 +8,64 @@ pub struct Route {
     pub destination: String,
     pub gateway: String,
     pub metric: String,
+}
+
+pub fn valid_ipv4_cidr(value: &str) -> bool {
+    if value == "default" {
+        return true;
+    }
+    let Some((addr, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    addr.parse::<Ipv4Addr>().is_ok() && prefix.parse::<u8>().map(|p| p <= 32).unwrap_or(false)
+}
+
+pub fn valid_ipv4_gateway(value: &str) -> bool {
+    value.is_empty() || value.parse::<Ipv4Addr>().is_ok()
+}
+
+pub fn valid_ipv4_addresses(value: &str, required: bool) -> bool {
+    let addresses: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .collect();
+    if required && addresses.is_empty() {
+        return false;
+    }
+    addresses.iter().all(|address| {
+        let Some((ip, prefix)) = address.split_once('/') else {
+            return false;
+        };
+        ip.parse::<Ipv4Addr>().is_ok()
+            && prefix
+                .parse::<u8>()
+                .map(|value| value <= 32)
+                .unwrap_or(false)
+    })
+}
+
+pub fn valid_ipv4_method(value: &str) -> bool {
+    matches!(
+        value,
+        "auto" | "manual" | "shared" | "link-local" | "disabled"
+    )
+}
+
+pub fn valid_autoconnect(value: &str) -> bool {
+    matches!(value, "yes" | "no")
+}
+
+pub fn valid_dns_servers(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .all(|server| server.parse::<IpAddr>().is_ok())
+}
+
+pub fn valid_metric(value: &str) -> bool {
+    value.is_empty() || value.parse::<u32>().is_ok()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,7 +163,7 @@ pub async fn load_profiles() -> Result<Vec<Profile>> {
             continue;
         }
         let name = fields[0].clone();
-        let details = run(&["-t", "-g", "ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.route-metric,ipv4.dns,ipv4.dns-search,ipv4.routes", "connection", "show", &name]).await.unwrap_or_default();
+        let details = run(&["-t", "-g", "ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.route-metric,ipv4.dns,ipv4.dns-search,ipv4.routes", "connection", "show", &name]).await.with_context(|| format!("failed to load NetworkManager profile {name}"))?;
         let values: Vec<String> = details.lines().map(str::trim).map(str::to_string).collect();
         let routes = values.get(6).map(|v| parse_routes(v)).unwrap_or_default();
         let runtime_addresses = runtime_addresses(&fields[2]).await.unwrap_or_default();
@@ -216,6 +275,18 @@ pub async fn save_dns(profile: &Profile, dns: &str, search: &str) -> Result<()> 
     .map(|_| ())
 }
 
+pub async fn save_autoconnect(profile: &Profile, autoconnect: &str) -> Result<()> {
+    run(&[
+        "connection",
+        "modify",
+        profile.name.as_str(),
+        "connection.autoconnect",
+        autoconnect,
+    ])
+    .await
+    .map(|_| ())
+}
+
 pub async fn save_route(profile: &Profile, old: Option<&Route>, route: &Route) -> Result<()> {
     let mut routes = profile.routes.clone();
     if let Some(old) = old {
@@ -286,5 +357,38 @@ mod tests {
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].destination, "10.20.0.0/16");
         assert_eq!(routes[0].metric, "50");
+    }
+
+    #[test]
+    fn route_validation() {
+        assert!(valid_ipv4_cidr("10.20.0.0/16"));
+        assert!(valid_ipv4_cidr("default"));
+        assert!(!valid_ipv4_cidr("10.20.0.0/33"));
+        assert!(valid_ipv4_gateway("192.168.10.1"));
+        assert!(valid_ipv4_gateway(""));
+        assert!(!valid_ipv4_gateway("not-an-ip"));
+        assert!(valid_metric("100"));
+        assert!(!valid_metric("fast"));
+    }
+
+    #[test]
+    fn ipv4_profile_validation() {
+        assert!(valid_ipv4_method("auto"));
+        assert!(valid_ipv4_method("manual"));
+        assert!(!valid_ipv4_method("dhcp"));
+        assert!(valid_ipv4_addresses("192.168.10.2/24, 10.0.0.2/8", true));
+        assert!(valid_ipv4_addresses("", false));
+        assert!(!valid_ipv4_addresses("", true));
+        assert!(!valid_ipv4_addresses("192.168.10.2", true));
+        assert!(valid_autoconnect("yes"));
+        assert!(valid_autoconnect("no"));
+        assert!(!valid_autoconnect("sometimes"));
+    }
+
+    #[test]
+    fn dns_validation_accepts_ipv4_and_ipv6() {
+        assert!(valid_dns_servers("1.1.1.1, 2606:4700:4700::1111"));
+        assert!(valid_dns_servers(""));
+        assert!(!valid_dns_servers("not-a-resolver"));
     }
 }

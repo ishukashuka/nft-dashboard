@@ -1,31 +1,37 @@
-# nft-dashboard
+# AEGIS Network Control
 
-> **Note:** This project was generated with AI assistance. I created this dashboard as a personal tool to help manage `nftables` firewalls visually while learning terminal utilities and Linux networking.
+AEGIS is a Linux terminal control plane for inspecting and managing three related network surfaces from one keyboard-first workspace:
 
-A modern, asynchronous terminal dashboard for managing `nftables` firewall rulesets, built with Rust, Ratatui, Crossterm, and Tokio.
+- nftables rules, counters, filtering, sorting, inspection, and reviewed mutations
+- persistent NetworkManager IPv4, DNS, autoconnect, and route configuration
+- live listening sockets and active connections with process ownership where permissions allow
 
-![Rust](https://img.shields.io/badge/rust-2021-orange.svg)
-![Platform](https://img.shields.io/badge/platform-linux-blue.svg)
+The interface is intentionally conservative around changes. Firewall and NetworkManager writes show a review or confirmation screen before execution, and unsupported nftables expressions are never silently round-tripped through the structured editor.
 
-## Features
+## Requirements
 
-- **Hierarchical Navigation:** Filter rulesets dynamically by Table/Chain using a dedicated sidebar (`Tab` to toggle focus).
-- **Structured Rule Parser:** Automatically breaks down `nftables` JSON AST into dedicated columns: Source, Destination, Protocol/Match, Action, and Counters.
-- **Rule Inspector:** Inspect full generated statements and raw JSON trees with vertical scrolling (`v` / `Enter`, `j` / `k`).
-- **Rule Management:** Add (`a`), Insert (`i`), Edit/Replace (`e`), and Delete (`x`) rules directly from modal popups.
-- **Safety Safeguards:** Deletion confirmation dialogs and `stderr` syntax error popups.
-- **Auto-Refresh:** Keeps UI synced in real-time with background changes made by Docker, Libvirt, or Fail2ban.
+- Linux
+- `nft` for the Firewall workspace
+- `nmcli` for the Network workspace
+- `ss` for the Ports workspace
+- a current stable Rust toolchain to build
 
-## Prerequisites
+Reading or changing nftables commonly requires root or `CAP_NET_ADMIN`. Process details from `ss` may also be limited for unprivileged users. A Firewall permission error does not prevent using Network or Ports.
 
-- **Linux Operating System** (Kernel supporting `nftables`)
-- **`nft` CLI binary** installed and available in `$PATH`
-- **Root/`sudo` access** (required to fetch and modify kernel firewall tables)
-- **Rust Toolchain** (if compiling from source)
+## Run
 
-## Quick Start
+```bash
+cargo run --release
+```
 
-1. Clone the repository:
-   ```bash
-   git clone [https://github.com/ishukashuka/nft-dashboard.git](https://github.com/ishukashuka/nft-dashboard.git)
-   cd nft-dashboard
+Use `F1`, `F2`, and `F3` to switch workspaces. Press `?` on any workspace for its local key reference, or `q` to quit. The footer always shows the controls valid for the current mode.
+
+Network edits change persistent NetworkManager profiles. AEGIS deliberately does not reactivate a connection automatically, because doing so can interrupt remote access.
+
+## Development
+
+```bash
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt -- --check
+```

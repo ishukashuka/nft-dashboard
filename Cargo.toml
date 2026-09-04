@@ -2,6 +2,7 @@
 name = "nft-dashboard"
 version = "0.1.0"
 edition = "2021"
+description = "AEGIS keyboard-first network control TUI for nftables, NetworkManager, and sockets"
 
 [dependencies]
 anyhow = "1.0"
