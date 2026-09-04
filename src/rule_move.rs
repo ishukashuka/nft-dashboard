@@ -106,13 +106,13 @@ impl RuleMovePlan {
         format!(
             "{command} rule {} {} {} handle {} {}\ndelete rule {} {} {} handle {}\n",
             self.family,
-            quote(&self.table),
-            quote(&self.chain),
+            self.table,
+            self.chain,
             self.anchor_handle,
             self.selected_statement,
             self.family,
-            quote(&self.table),
-            quote(&self.chain),
+            self.table,
+            self.chain,
             self.selected_handle,
         )
     }
@@ -146,10 +146,6 @@ impl RuleMovePlan {
     }
 }
 
-fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +174,7 @@ mod tests {
         assert_eq!(plan.destination_index, 0);
         assert!(plan
             .script()
-            .starts_with("insert rule inet \"pintech\" \"input\" handle 10 drop"));
+            .starts_with("insert rule inet pintech input handle 10 drop"));
         assert!(plan.script().ends_with("handle 20\n"));
     }
 
@@ -189,7 +185,7 @@ mod tests {
         assert_eq!(plan.destination_index, 1);
         assert!(plan
             .script()
-            .starts_with("add rule inet \"pintech\" \"input\" handle 20 accept"));
+            .starts_with("add rule inet pintech input handle 20 accept"));
         assert!(RuleMovePlan::build(&rules, &rules[0], RuleMoveDirection::Up).is_err());
         assert!(RuleMovePlan::build(&rules, &rules[1], RuleMoveDirection::Down).is_err());
     }

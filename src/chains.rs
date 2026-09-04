@@ -224,8 +224,8 @@ impl ChainForm {
 
     fn script(&self) -> String {
         let family = &self.family;
-        let table = quote(self.table.trim());
-        let name = quote(self.name.value.trim());
+        let table = self.table.trim();
+        let name = self.name.value.trim();
         if self.operation == ChainOperation::Add {
             if !self.base_chain {
                 return format!("add chain {family} {table} {name}\n");
@@ -233,7 +233,7 @@ impl ChainForm {
             let device = if self.device.value.trim().is_empty() {
                 String::new()
             } else {
-                format!(" device {}", quote(self.device.value.trim()))
+                format!(" device {}", self.device.value.trim())
             };
             return format!(
                 "add chain {family} {table} {name} {{ type {} hook {}{} priority {}; policy {}; }}\n",
@@ -249,7 +249,7 @@ impl ChainForm {
         if self.original_name != self.name.value.trim() {
             script.push_str(&format!(
                 "rename chain {family} {table} {} {name}\n",
-                quote(&self.original_name)
+                self.original_name.as_str()
             ));
         }
         if self.base_chain && self.original_policy != self.policy.value.trim() {
@@ -274,20 +274,13 @@ pub(crate) async fn apply(form: &ChainForm) -> Result<()> {
 pub(crate) async fn flush(chain: &FirewallChain) -> Result<()> {
     run_script(&format!(
         "flush chain {} {} {}\n",
-        chain.family,
-        quote(&chain.table),
-        quote(&chain.name)
+        chain.family, chain.table, chain.name
     ))
     .await
 }
 
 pub(crate) async fn delete(chain: &FirewallChain, flush_first: bool) -> Result<()> {
-    let target = format!(
-        "{} {} {}",
-        chain.family,
-        quote(&chain.table),
-        quote(&chain.name)
-    );
+    let target = format!("{} {} {}", chain.family, chain.table, chain.name);
     let script = if flush_first {
         format!("flush chain {target}\ndelete chain {target}\n")
     } else {
@@ -335,8 +328,11 @@ fn validate_identifier(value: &str, label: &str) -> Result<()> {
     if value.is_empty() {
         bail!("{label} name is required");
     }
-    if value.chars().any(char::is_control) {
-        bail!("{label} name contains a control character");
+    if value.chars().any(|character| {
+        !(character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '-' | '.' | '/' | ':' | '*'))
+    }) {
+        bail!("{label} name contains unsupported characters");
     }
     Ok(())
 }
@@ -371,10 +367,6 @@ fn validate_policy(value: &str) -> Result<()> {
     }
 }
 
-fn quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 fn display_optional(value: &str) -> &str {
     if value.is_empty() {
         "-"
@@ -391,7 +383,7 @@ mod tests {
     fn regular_and_base_chain_scripts_are_complete() {
         let mut form = ChainForm::new("inet", "pintech");
         form.name = TextField::from("services");
-        assert_eq!(form.script(), "add chain inet \"pintech\" \"services\"\n");
+        assert_eq!(form.script(), "add chain inet pintech services\n");
 
         form.base_chain = true;
         form.hook = TextField::from("input");
@@ -427,7 +419,7 @@ mod tests {
         form.name = TextField::from("host_input");
         form.policy = TextField::from("drop");
         let script = form.script();
-        assert!(script.starts_with("rename chain inet \"pintech\" \"input\" \"host_input\""));
-        assert!(script.contains("add chain inet \"pintech\" \"host_input\" { policy drop; }"));
+        assert!(script.starts_with("rename chain inet pintech input host_input"));
+        assert!(script.contains("add chain inet pintech host_input { policy drop; }"));
     }
 }
