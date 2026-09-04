@@ -858,6 +858,31 @@ pub(crate) fn draw_chain_modal(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
+pub(crate) fn draw_rule_move_modal(f: &mut ratatui::Frame, app: &App) {
+    let area = centered_fixed(100, 22, f.size());
+    f.render_widget(Clear, area);
+    let text = app
+        .pending_rule_move
+        .as_ref()
+        .map(RuleMovePlan::preview)
+        .unwrap_or_else(|| "The rule move is no longer available.".into());
+    f.render_widget(
+        Paragraph::new(format!(
+            "{}\n\n[Enter] Apply atomically   [Esc] Cancel",
+            text
+        ))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Review evaluation-order change ")
+                .style(Style::default().bg(MODAL))
+                .border_style(Style::default().fg(ACTIVE)),
+        ),
+        area,
+    );
+}
+
 pub(crate) fn draw_command_bar(f: &mut ratatui::Frame, app: &App) {
     let screen = f.size();
     let area = Rect::new(

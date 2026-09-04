@@ -1,8 +1,8 @@
 use crate::{
     chains::{ChainDestructiveAction, ChainForm},
     filter::FilterQuery,
-    firewall, network, sockets, FirewallChain, FirewallTable, InspectorTab, Rule, RulesetSnapshot,
-    SocketTab,
+    firewall, network, sockets, FirewallChain, FirewallTable, InspectorTab, Rule, RuleMovePlan,
+    RulesetSnapshot, SocketTab,
 };
 use ratatui::widgets::{ListState, TableState};
 
@@ -176,6 +176,7 @@ pub(crate) enum Mode {
     ChainEdit,
     ChainReview,
     ChainConfirm,
+    RuleMoveReview,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -537,6 +538,7 @@ pub(crate) struct App {
     pub(crate) network_action: String,
     pub(crate) chain_form: Option<ChainForm>,
     pub(crate) chain_destructive_action: ChainDestructiveAction,
+    pub(crate) pending_rule_move: Option<RuleMovePlan>,
     pub(crate) sort_key: firewall::SortKey,
     pub(crate) sort_reverse: bool,
     pub(crate) sort_index: usize,
@@ -623,6 +625,7 @@ impl App {
             network_action: String::new(),
             chain_form: None,
             chain_destructive_action: ChainDestructiveAction::Delete,
+            pending_rule_move: None,
             sort_key: firewall::SortKey::ChainOrder,
             sort_reverse: false,
             sort_index: 0,

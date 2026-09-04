@@ -27,12 +27,14 @@ mod chains;
 mod filter;
 mod firewall;
 mod network;
+mod rule_move;
 mod rules;
 mod sockets;
 mod state;
 mod views;
 
 use chains::*;
+use rule_move::*;
 use rules::*;
 use state::*;
 use views::*;
@@ -50,6 +52,7 @@ async fn open_firewall(app: &mut App) {
     app.section = Section::Firewall;
     app.network_form = None;
     app.chain_form = None;
+    app.pending_rule_move = None;
     app.network_focus = false;
     match fetch_ruleset().await {
         Ok(snapshot) => {
@@ -96,6 +99,36 @@ fn prepare_rule_review(app: &mut App) {
     } else {
         app.pending_statement = draft.generated_for_family(&app.form.family.value);
         app.mode = Mode::RuleReview;
+    }
+}
+
+fn prepare_rule_move(app: &mut App, direction: RuleMoveDirection) {
+    if app.focus != Focus::Table {
+        app.status_msg = "Focus the Rules pane before moving a rule".into();
+        return;
+    }
+    if app.selected_firewall_chain().is_none() {
+        app.status_msg = "Select a specific chain before moving a rule".into();
+        return;
+    }
+    if app.sort_key != firewall::SortKey::ChainOrder || app.sort_reverse {
+        app.status_msg = "Rule movement requires Chain order sorted in the normal direction".into();
+        return;
+    }
+    if !app.filter.value.trim().is_empty() {
+        app.status_msg = "Clear the rule filter before moving a rule".into();
+        return;
+    }
+    let Some(selected) = app.selected_rule() else {
+        app.status_msg = "Select a rule to move".into();
+        return;
+    };
+    match RuleMovePlan::build(&app.rules, selected, direction) {
+        Ok(plan) => {
+            app.pending_rule_move = Some(plan);
+            app.mode = Mode::RuleMoveReview;
+        }
+        Err(error) => app.status_msg = format!("Cannot move rule: {error}"),
     }
 }
 
@@ -361,7 +394,7 @@ async fn main() -> Result<()> {
                 Mode::Normal => match app.focus {
                     Focus::Sidebar => " Tables are read-only  j/k Move  Tab Chains  : Command  ? Keys ",
                     Focus::Chains => " Chains  a New  e Rename/Policy  X Flush  x Delete  j/k Move  ? Keys ",
-                    Focus::Table => " Rules  a Add  i Insert  e Edit  x Delete  Enter Inspect  s Sort  ? Keys ",
+                    Focus::Table => " Rules  K/J Move  a Add  i Insert  e Edit  x Delete  Enter Inspect  s Sort  ? Keys ",
                 },
                 Mode::Add | Mode::Insert | Mode::Edit => " Tab Field  j/k Select  Space Toggle  F4 Advanced  Enter Review  Esc Cancel ",
                 Mode::ConfirmDelete => " [y] Confirm Delete | [n/Esc] Cancel ",
@@ -379,6 +412,7 @@ async fn main() -> Result<()> {
                 Mode::ChainEdit => " NORMAL j/k Field  h/l Choice  i Insert  Enter Review  Esc Cancel ",
                 Mode::ChainReview => " [Enter] Apply chain change  [Esc] Back ",
                 Mode::ChainConfirm => " [y] Confirm destructive action  [n/Esc] Cancel ",
+                Mode::RuleMoveReview => " [Enter] Apply rule move  [Esc] Cancel ",
             };
 
             let footer_layout = Layout::default()
@@ -597,6 +631,7 @@ async fn main() -> Result<()> {
                 Mode::ChainEdit | Mode::ChainReview | Mode::ChainConfirm => {
                     draw_chain_modal(f, &app)
                 }
+                Mode::RuleMoveReview => draw_rule_move_modal(f, &app),
                 _ => {}
             }
         })?;
@@ -644,13 +679,14 @@ async fn main() -> Result<()> {
                     app.mode = Mode::Command;
                     continue;
                 }
-                let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort | Mode::Command | Mode::CommandOutput | Mode::ChainEdit | Mode::ChainReview | Mode::ChainConfirm);
+                let section_switch_owned = matches!(app.mode, Mode::Add | Mode::Insert | Mode::Edit | Mode::Filter | Mode::ConfirmDelete | Mode::NetworkEdit | Mode::NetworkConfirm | Mode::RuleReview | Mode::Sort | Mode::Command | Mode::CommandOutput | Mode::ChainEdit | Mode::ChainReview | Mode::ChainConfirm | Mode::RuleMoveReview);
                 if key.code == KeyCode::F(1) && !section_switch_owned {
                     open_firewall(&mut app).await;
                     continue;
                 }
                 if key.code == KeyCode::F(2) && !section_switch_owned {
                     app.chain_form = None;
+                    app.pending_rule_move = None;
                     match network::load_profiles().await {
                         Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.repair_network_selection(); app.section = Section::Network; app.mode = Mode::Normal; app.network_focus = true; app.error_msg.clear(); app.status_msg = "Network loaded".into(); }
                         Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; }
@@ -659,6 +695,7 @@ async fn main() -> Result<()> {
                 }
                 if key.code == KeyCode::F(3) && !section_switch_owned {
                     app.chain_form = None;
+                    app.pending_rule_move = None;
                     let listening = app.socket_tab == SocketTab::Listening;
                     match sockets::client::load(listening).await {
                         Ok(entries) => { app.replace_sockets(entries); if app.section != Section::Ports { app.previous_section = app.section; } app.section = Section::Ports; app.mode = Mode::Normal; app.error_msg.clear(); app.status_msg = "Ports loaded".into(); }
@@ -819,6 +856,12 @@ async fn main() -> Result<()> {
                         KeyCode::Char('g') if app.pending_g => { app.go_first(); app.pending_g = false; },
                         KeyCode::Char('g') => app.pending_g = true,
                         KeyCode::Char('G') => app.go_last(),
+                        KeyCode::Char('K') => {
+                            prepare_rule_move(&mut app, RuleMoveDirection::Up)
+                        }
+                        KeyCode::Char('J') => {
+                            prepare_rule_move(&mut app, RuleMoveDirection::Down)
+                        }
                         KeyCode::Char('a') if app.focus == Focus::Chains => {
                             if let Some(table) = app.selected_firewall_table() {
                                 app.chain_form = Some(ChainForm::new(&table.family, &table.name));
@@ -885,7 +928,7 @@ async fn main() -> Result<()> {
                         KeyCode::Char('/') => app.mode = Mode::Filter,
                         KeyCode::Char('s') => app.mode = Mode::Sort,
                         KeyCode::Char('S') => { app.sort_reverse = !app.sort_reverse; app.recompute_visible(); },
-                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · actions follow the focused pane\nChains: a create · e rename/policy · X flush · x delete\nRules: a append · i insert · e edit · x delete · Enter inspect\nGlobal: j/k navigate · gg/G first/last · / filter · s sort · :!command shell · r refresh · F1/F2/F3 section · q quit".into(); app.mode = Mode::Help; },
+                        KeyCode::Char('?') => { app.error_msg = "Tab switches Tables, Chains, and Rules · actions follow the focused pane\nChains: a create · e rename/policy · X flush · x delete\nRules: K move up · J move down · a append · i insert · e edit · x delete · Enter inspect\nGlobal: j/k navigate · gg/G first/last · / filter · s sort · :!command shell · r refresh · F1/F2/F3 section · q quit".into(); app.mode = Mode::Help; },
                         KeyCode::Char('r') => match fetch_ruleset().await {
                             Ok(snapshot) => { app.apply_firewall_snapshot(snapshot); app.status_msg = "Refreshed".to_string(); }
                             Err(e) => app.status_msg = format!("Refresh failed: {}", e),
@@ -1049,6 +1092,52 @@ async fn main() -> Result<()> {
                                         ChainDestructiveAction::Flush => "Chain flushed".into(),
                                         ChainDestructiveAction::Delete => "Chain deleted".into(),
                                     };
+                                    app.mode = Mode::Normal;
+                                }
+                                Err(error) => {
+                                    app.error_msg = error.to_string();
+                                    app.mode = Mode::Error;
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Mode::RuleMoveReview => match key.code {
+                        KeyCode::Esc => {
+                            app.pending_rule_move = None;
+                            app.mode = Mode::Normal;
+                        }
+                        KeyCode::Enter => {
+                            let plan = app.pending_rule_move.clone();
+                            let result = if let Some(plan) = plan.as_ref() {
+                                plan.apply().await
+                            } else {
+                                Ok(())
+                            };
+                            match result {
+                                Ok(()) => {
+                                    if let Some(plan) = plan {
+                                        if let Ok(snapshot) = fetch_ruleset().await {
+                                            app.apply_firewall_snapshot(snapshot);
+                                            app.select_firewall_chain(
+                                                &plan.family,
+                                                &plan.table,
+                                                &plan.chain,
+                                            );
+                                            if !app.visible.is_empty() {
+                                                app.table_state.select(Some(
+                                                    plan.destination_index
+                                                        .min(app.visible.len() - 1),
+                                                ));
+                                            }
+                                        }
+                                        app.status_msg = format!(
+                                            "Moved rule {} {}",
+                                            plan.selected_handle,
+                                            plan.direction.label()
+                                        );
+                                    }
+                                    app.pending_rule_move = None;
                                     app.mode = Mode::Normal;
                                 }
                                 Err(error) => {
@@ -1225,7 +1314,9 @@ async fn main() -> Result<()> {
                     Mode::Error => match key.code {
                         KeyCode::Esc | KeyCode::Enter => {
                             app.error_msg.clear();
-                            app.mode = if app.chain_form.is_some() {
+                            app.mode = if app.pending_rule_move.is_some() {
+                                Mode::RuleMoveReview
+                            } else if app.chain_form.is_some() {
                                 Mode::ChainReview
                             } else {
                                 Mode::Normal
