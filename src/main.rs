@@ -4,19 +4,27 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::text::Line;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+    },
     Terminal,
 };
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time;
+mod network;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Verdict {
@@ -85,7 +93,10 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 fn describe_operand(op: &Value) -> String {
     if let Some(payload) = op.get("payload") {
-        let proto = payload.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+        let proto = payload
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let field = payload.get("field").and_then(|v| v.as_str()).unwrap_or("");
         return format!("{} {}", proto, field).trim().to_string();
     }
@@ -102,8 +113,12 @@ fn describe_operand(op: &Value) -> String {
         let len = prefix.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
         return format!("{}/{}", addr, len);
     }
-    if let Some(s) = op.as_str() { return s.to_string(); }
-    if let Some(n) = op.as_u64() { return n.to_string(); }
+    if let Some(s) = op.as_str() {
+        return s.to_string();
+    }
+    if let Some(n) = op.as_u64() {
+        return n.to_string();
+    }
     if let Some(arr) = op.as_array() {
         let parts: Vec<String> = arr.iter().map(describe_operand).collect();
         return format!("{{{}}}", parts.join(", "));
@@ -125,7 +140,7 @@ fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
             let left = m.get("left").map(describe_operand).unwrap_or_default();
             let right = m.get("right").map(describe_operand).unwrap_or_default();
             let op = m.get("op").and_then(|v| v.as_str()).unwrap_or("==");
-            
+
             let clean_left = left
                 .replace("meta iifname", "iif")
                 .replace("meta oifname", "oif")
@@ -138,7 +153,9 @@ fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
                 _ => format!("{} ", op),
             };
 
-            let match_str = format!("{} {}{}", clean_left, op_str, right).trim().to_string();
+            let match_str = format!("{} {}{}", clean_left, op_str, right)
+                .trim()
+                .to_string();
             raw_parts.push(match_str.clone());
 
             if clean_left.contains("saddr") || clean_left.contains("iif") {
@@ -174,7 +191,10 @@ fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
             raw_parts.push(action.clone());
             verdict = Verdict::Jump;
         } else if let Some(c) = item.get("counter") {
-            if let (Some(p), Some(b)) = (c.get("packets").and_then(|v| v.as_u64()), c.get("bytes").and_then(|v| v.as_u64())) {
+            if let (Some(p), Some(b)) = (
+                c.get("packets").and_then(|v| v.as_u64()),
+                c.get("bytes").and_then(|v| v.as_u64()),
+            ) {
                 counters = format!("{}p / {}b", p, b);
                 raw_parts.push(format!("counter packets {} bytes {}", p, b));
             }
@@ -182,14 +202,38 @@ fn parse_expr_structured(expr: &[Value]) -> (ParsedRuleExpr, String, Verdict) {
     }
 
     let parsed = ParsedRuleExpr {
-        src: if src_parts.is_empty() { "ANY".to_string() } else { src_parts.join(" ") },
-        dst: if dst_parts.is_empty() { "ANY".to_string() } else { dst_parts.join(" ") },
-        proto_port: if proto_parts.is_empty() { "ANY".to_string() } else { proto_parts.join(" ") },
-        counters: if counters.is_empty() { "-".to_string() } else { counters },
-        action: if action.is_empty() { "other".to_string() } else { action },
+        src: if src_parts.is_empty() {
+            "ANY".to_string()
+        } else {
+            src_parts.join(" ")
+        },
+        dst: if dst_parts.is_empty() {
+            "ANY".to_string()
+        } else {
+            dst_parts.join(" ")
+        },
+        proto_port: if proto_parts.is_empty() {
+            "ANY".to_string()
+        } else {
+            proto_parts.join(" ")
+        },
+        counters: if counters.is_empty() {
+            "-".to_string()
+        } else {
+            counters
+        },
+        action: if action.is_empty() {
+            "other".to_string()
+        } else {
+            action
+        },
     };
 
-    let raw_str = if raw_parts.is_empty() { "(empty)".to_string() } else { raw_parts.join(" ") };
+    let raw_str = if raw_parts.is_empty() {
+        "(empty)".to_string()
+    } else {
+        raw_parts.join(" ")
+    };
     (parsed, raw_str, verdict)
 }
 
@@ -201,10 +245,17 @@ struct TextField {
 
 impl TextField {
     fn from(s: &str) -> Self {
-        Self { value: s.to_string(), cursor: s.chars().count() }
+        Self {
+            value: s.to_string(),
+            cursor: s.chars().count(),
+        }
     }
     fn byte_index(&self) -> usize {
-        self.value.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.value.len())
+        self.value
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.value.len())
     }
     fn insert(&mut self, c: char) {
         let idx = self.byte_index();
@@ -212,7 +263,9 @@ impl TextField {
         self.cursor += 1;
     }
     fn backspace(&mut self) {
-        if self.cursor == 0 { return; }
+        if self.cursor == 0 {
+            return;
+        }
         let idx = self.byte_index();
         if let Some(prev) = self.value[..idx].chars().next_back() {
             let new_idx = idx - prev.len_utf8();
@@ -222,19 +275,77 @@ impl TextField {
     }
     fn delete(&mut self) {
         let idx = self.byte_index();
-        if idx < self.value.len() { self.value.remove(idx); }
+        if idx < self.value.len() {
+            self.value.remove(idx);
+        }
     }
-    fn left(&mut self) { if self.cursor > 0 { self.cursor -= 1; } }
-    fn right(&mut self) { if self.cursor < self.value.chars().count() { self.cursor += 1; } }
-    fn home(&mut self) { self.cursor = 0; }
-    fn end(&mut self) { self.cursor = self.value.chars().count(); }
-    fn clear(&mut self) { self.value.clear(); self.cursor = 0; }
+    fn left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+    fn right(&mut self) {
+        if self.cursor < self.value.chars().count() {
+            self.cursor += 1;
+        }
+    }
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+    fn end(&mut self) {
+        self.cursor = self.value.chars().count();
+    }
+    fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+    }
 }
 
 #[derive(Debug, PartialEq)]
 enum Focus {
     Sidebar,
     Table,
+}
+
+#[derive(Debug, PartialEq)]
+enum Section {
+    Firewall,
+    Network,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum NetworkTab {
+    General,
+    Ipv4,
+    Routes,
+    Dns,
+}
+
+impl NetworkTab {
+    fn next(self) -> Self {
+        match self {
+            Self::General => Self::Ipv4,
+            Self::Ipv4 => Self::Routes,
+            Self::Routes => Self::Dns,
+            Self::Dns => Self::General,
+        }
+    }
+    fn previous(self) -> Self {
+        match self {
+            Self::General => Self::Dns,
+            Self::Ipv4 => Self::General,
+            Self::Routes => Self::Ipv4,
+            Self::Dns => Self::Routes,
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Ipv4 => "IPv4",
+            Self::Routes => "Routes",
+            Self::Dns => "DNS",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -248,6 +359,8 @@ enum Mode {
     ConfirmDelete,
     Error,
     FatalError,
+    NetworkEdit,
+    NetworkConfirm,
 }
 
 struct RuleForm {
@@ -256,6 +369,13 @@ struct RuleForm {
     table: TextField,
     chain: TextField,
     statement: TextField,
+    location_locked: bool,
+}
+
+struct NetworkForm {
+    field_idx: usize,
+    fields: Vec<TextField>,
+    title: String,
 }
 
 impl RuleForm {
@@ -266,6 +386,7 @@ impl RuleForm {
             table: TextField::from("filter"),
             chain: TextField::from("INPUT"),
             statement: TextField::from(""),
+            location_locked: false,
         }
     }
     fn from_rule(rule: &Rule) -> Self {
@@ -275,10 +396,19 @@ impl RuleForm {
             table: TextField::from(&rule.table),
             chain: TextField::from(&rule.chain),
             statement: TextField::from(&rule.expression),
+            location_locked: true,
         }
     }
-    fn next_field(&mut self) { self.field_idx = (self.field_idx + 1) % 4; }
-    fn prev_field(&mut self) { self.field_idx = if self.field_idx == 0 { 3 } else { self.field_idx - 1 }; }
+    fn next_field(&mut self) {
+        self.field_idx = (self.field_idx + 1) % 4;
+    }
+    fn prev_field(&mut self) {
+        self.field_idx = if self.field_idx == 0 {
+            3
+        } else {
+            self.field_idx - 1
+        };
+    }
     fn active_field_mut(&mut self) -> &mut TextField {
         match self.field_idx {
             0 => &mut self.family,
@@ -302,6 +432,14 @@ struct App {
     status_msg: String,
     error_msg: String,
     detail_scroll: u16,
+    section: Section,
+    profiles: Vec<network::Profile>,
+    network_selected: usize,
+    network_route_selected: usize,
+    network_tab: NetworkTab,
+    network_focus: bool,
+    network_form: Option<NetworkForm>,
+    network_action: String,
 }
 
 impl App {
@@ -319,6 +457,14 @@ impl App {
             status_msg: "Ready".to_string(),
             error_msg: String::new(),
             detail_scroll: 0,
+            section: Section::Firewall,
+            profiles: Vec::new(),
+            network_selected: 0,
+            network_route_selected: 0,
+            network_tab: NetworkTab::General,
+            network_focus: false,
+            network_form: None,
+            network_action: String::new(),
         }
     }
 
@@ -334,9 +480,13 @@ impl App {
         if self.sidebar_state.selected().is_none() {
             self.sidebar_state.select(Some(0));
         }
+        self.repair_selection();
     }
 
     fn recompute_visible(&mut self) {
+        let selected_identity = self
+            .selected_rule()
+            .map(|r| (r.family.clone(), r.table.clone(), r.chain.clone(), r.handle));
         let q = self.filter.value.trim().to_lowercase();
         let selected_tree = self
             .sidebar_state
@@ -364,7 +514,19 @@ impl App {
         if self.visible.is_empty() {
             self.table_state.select(None);
         } else {
-            let sel = self.table_state.selected().unwrap_or(0).min(self.visible.len() - 1);
+            let sel = selected_identity
+                .and_then(|id| {
+                    self.visible.iter().position(|&idx| {
+                        let r = &self.rules[idx];
+                        (r.family.clone(), r.table.clone(), r.chain.clone(), r.handle) == id
+                    })
+                })
+                .unwrap_or_else(|| {
+                    self.table_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.visible.len() - 1)
+                });
             self.table_state.select(Some(sel));
         }
     }
@@ -398,7 +560,13 @@ impl App {
             Focus::Sidebar => {
                 if !self.sidebar_items.is_empty() {
                     let i = match self.sidebar_state.selected() {
-                        Some(i) => if i == 0 { self.sidebar_items.len() - 1 } else { i - 1 },
+                        Some(i) => {
+                            if i == 0 {
+                                self.sidebar_items.len() - 1
+                            } else {
+                                i - 1
+                            }
+                        }
                         None => 0,
                     };
                     self.sidebar_state.select(Some(i));
@@ -423,13 +591,267 @@ impl App {
             .and_then(|i| self.visible.get(i))
             .and_then(|&idx| self.rules.get(idx))
     }
+
+    fn repair_selection(&mut self) {
+        if self.sidebar_items.is_empty() {
+            self.sidebar_state.select(None);
+        } else {
+            self.sidebar_state.select(Some(
+                self.sidebar_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.sidebar_items.len() - 1),
+            ));
+        }
+    }
+}
+
+fn draw_network(f: &mut ratatui::Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(f.size());
+    let head =
+        Paragraph::new(" Network  |  persistent NetworkManager profiles + current kernel state ")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" NFTables Firewall Dashboard ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+    f.render_widget(head, chunks[0]);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(chunks[1]);
+    let items = app
+        .profiles
+        .iter()
+        .map(|p| {
+            ListItem::new(format!(
+                "{}  {} {}",
+                p.name,
+                if p.state.contains("activated") {
+                    "●"
+                } else {
+                    "○"
+                },
+                if p.device.is_empty() { "--" } else { &p.device }
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !app.profiles.is_empty() {
+        state.select(Some(app.network_selected.min(app.profiles.len() - 1)));
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Connections ")
+                .border_style(Style::default().fg(if app.network_focus {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                })),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 50, 75))
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, panes[0], &mut state);
+    if let Some(p) = app.profiles.get(app.network_selected) {
+        let tabs = [
+            NetworkTab::General,
+            NetworkTab::Ipv4,
+            NetworkTab::Routes,
+            NetworkTab::Dns,
+        ]
+        .iter()
+        .map(|t| {
+            if *t == app.network_tab {
+                format!("[ {} ]", t.title())
+            } else {
+                format!("  {}  ", t.title())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+        let mut lines = vec![Line::from(tabs), Line::from("")];
+        match app.network_tab {
+            NetworkTab::General => {
+                lines.extend([
+                    Line::from(format!("Profile:      {}", p.name)),
+                    Line::from(format!(
+                        "Device:       {}",
+                        if p.device.is_empty() { "--" } else { &p.device }
+                    )),
+                    Line::from(format!("State:        {}", p.state)),
+                    Line::from(format!("Type:         {}", p.kind)),
+                    Line::from(format!("Autoconnect:  {}", p.autoconnect)),
+                    Line::from(""),
+                    Line::from(format!(
+                        "Runtime IPv4: {}",
+                        if p.runtime_addresses.is_empty() {
+                            "none".to_string()
+                        } else {
+                            p.runtime_addresses.join(", ")
+                        }
+                    )),
+                ]);
+            }
+            NetworkTab::Ipv4 => {
+                lines.extend([
+                    Line::from(format!("Method:       {}", p.ipv4_method)),
+                    Line::from(format!(
+                        "Addresses:    {}",
+                        if p.addresses.is_empty() {
+                            "none".to_string()
+                        } else {
+                            p.addresses.join(", ")
+                        }
+                    )),
+                    Line::from(format!(
+                        "Gateway:      {}",
+                        if p.gateway.is_empty() {
+                            "--"
+                        } else {
+                            &p.gateway
+                        }
+                    )),
+                    Line::from(format!(
+                        "Metric:       {}",
+                        if p.metric.is_empty() { "--" } else { &p.metric }
+                    )),
+                ]);
+            }
+            NetworkTab::Routes => {
+                lines.push(Line::from(
+                    "Destination/prefix       Gateway             Metric",
+                ));
+                for r in &p.routes {
+                    lines.push(Line::from(format!(
+                        "{:<25} {:<19} {}",
+                        r.destination, r.gateway, r.metric
+                    )));
+                }
+                if p.routes.is_empty() {
+                    lines.push(Line::from("No persistent routes"));
+                }
+            }
+            NetworkTab::Dns => {
+                lines.push(Line::from(format!(
+                    "DNS:     {}",
+                    if p.dns.is_empty() {
+                        "none".to_string()
+                    } else {
+                        p.dns.join(", ")
+                    }
+                )));
+                lines.push(Line::from(format!(
+                    "Search:  {}",
+                    if p.search.is_empty() {
+                        "none".to_string()
+                    } else {
+                        p.search.join(", ")
+                    }
+                )));
+            }
+        }
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", p.name))
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            panes[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new("No NetworkManager profiles found\n\nPress r to refresh.")
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title(" Details ")),
+            panes[1],
+        );
+    }
+    f.render_widget(Paragraph::new(" [Tab] Pane  [h/l] Tab  [j/k] Select  [e] Edit  [a] Add route  [d] Delete route  [r] Refresh  [?] Help  [q] Quit ").block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))), chunks[2]);
+}
+
+fn draw_network_modal(f: &mut ratatui::Frame, app: &App) {
+    let Some(form) = &app.network_form else {
+        return;
+    };
+    let area = centered_rect(sixty_percent(form.fields.len()), 45, f.size());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", form.title))
+        .border_style(Style::default().fg(Color::Yellow));
+    f.render_widget(block, area);
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints(vec![Constraint::Length(3); form.fields.len()])
+        .split(area);
+    for (i, field) in form.fields.iter().enumerate() {
+        f.render_widget(
+            Paragraph::new(field.value.as_str()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Field {} ", i + 1))
+                    .border_style(Style::default().fg(if i == form.field_idx {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    })),
+            ),
+            inner[i],
+        );
+    }
+    if app.mode == Mode::NetworkConfirm {
+        let confirm = centered_rect(60, 30, f.size());
+        f.render_widget(Clear, confirm);
+        let summary = format!("\n{}\n\nThis changes persistent NetworkManager configuration.\nThe active connection will not be reactivated automatically.\n\nPress y to apply or Esc to cancel.", app.network_action);
+        f.render_widget(
+            Paragraph::new(summary)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Confirm network change ")
+                        .border_style(Style::default().fg(Color::Red)),
+                ),
+            confirm,
+        );
+    }
+}
+
+fn sixty_percent(fields: usize) -> u16 {
+    if fields >= 4 {
+        70
+    } else {
+        60
+    }
 }
 
 async fn fetch_ruleset() -> Result<Vec<Rule>> {
-    let output = Command::new("nft").args(["--json", "list", "ruleset"]).output().await?;
+    let output = Command::new("nft")
+        .args(["--json", "list", "ruleset"])
+        .output()
+        .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() { bail!("nft exited with an error (are you running as root?)"); }
+        if stderr.is_empty() {
+            bail!("nft exited with an error (are you running as root?)");
+        }
         bail!(stderr);
     }
 
@@ -439,18 +861,43 @@ async fn fetch_ruleset() -> Result<Vec<Rule>> {
     if let Some(nftables) = root.get("nftables").and_then(|v| v.as_array()) {
         for item in nftables {
             if let Some(rule) = item.get("rule") {
-                let family = rule.get("family").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let table = rule.get("table").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let chain = rule.get("chain").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let family = rule
+                    .get("family")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let table = rule
+                    .get("table")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let chain = rule
+                    .get("chain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let handle = rule.get("handle").and_then(|v| v.as_u64()).unwrap_or(0);
                 let expr_val = rule.get("expr").cloned().unwrap_or(Value::Array(vec![]));
 
                 let (parsed, expression, verdict) = match expr_val.as_array() {
                     Some(arr) => parse_expr_structured(arr),
-                    None => (ParsedRuleExpr::default(), "(none)".to_string(), Verdict::Other),
+                    None => (
+                        ParsedRuleExpr::default(),
+                        "(none)".to_string(),
+                        Verdict::Other,
+                    ),
                 };
 
-                rules.push(Rule { family, table, chain, handle, parsed, expression, verdict, raw: expr_val });
+                rules.push(Rule {
+                    family,
+                    table,
+                    chain,
+                    handle,
+                    parsed,
+                    expression,
+                    verdict,
+                    raw: expr_val,
+                });
             }
         }
     }
@@ -509,10 +956,17 @@ async fn main() -> Result<()> {
     }
 
     let (tx, mut rx) = mpsc::channel::<KeyEvent>(100);
+    let input_running = Arc::new(AtomicBool::new(true));
+    let input_running_thread = Arc::clone(&input_running);
     std::thread::spawn(move || loop {
+        if !input_running_thread.load(Ordering::Relaxed) {
+            break;
+        }
         if crossterm::event::poll(Duration::from_millis(50)).unwrap_or(false) {
             if let Ok(Event::Key(key)) = event::read() {
-                if tx.blocking_send(key).is_err() { break; }
+                if tx.blocking_send(key).is_err() {
+                    break;
+                }
             }
         }
     });
@@ -529,6 +983,11 @@ async fn main() -> Result<()> {
                     .wrap(Wrap { trim: true })
                     .block(Block::default().title(" Error ").borders(Borders::ALL).border_style(Style::default().fg(Color::Red)));
                 f.render_widget(p, area);
+                return;
+            }
+            if app.section == Section::Network {
+                draw_network(f, &app);
+                if matches!(app.mode, Mode::NetworkEdit | Mode::NetworkConfirm) { draw_network_modal(f, &app); }
                 return;
             }
 
@@ -593,16 +1052,23 @@ async fn main() -> Result<()> {
             .highlight_style(Style::default().bg(Color::Rgb(40, 50, 75)).fg(Color::Yellow).add_modifier(Modifier::BOLD))
             .highlight_symbol("▶ ");
 
-            f.render_stateful_widget(table, main_chunks[1], &mut app.table_state);
+            if app.visible.is_empty() && !app.filter.value.trim().is_empty() {
+                let msg = format!("No rules match \"{}\".", app.filter.value);
+                f.render_widget(Paragraph::new(msg).alignment(Alignment::Center).block(Block::default().borders(Borders::ALL).title(" Rules ").border_style(Style::default().fg(table_border))), main_chunks[1]);
+            } else {
+                f.render_stateful_widget(table, main_chunks[1], &mut app.table_state);
+            }
 
             let footer_text = match app.mode {
-                Mode::Normal => " [Tab] Focus | [j/k] Nav | [a] Add | [i] Insert | [e] Edit | [x] Delete | [v] Detail | [/] Filter | [q] Quit ",
+                Mode::Normal => " [Tab] Pane | [j/k] Navigate | [a] Add | [i] Insert | [e] Edit | [x] Delete | [v] Detail | [/] Filter | [n] Network | [?] Help | [q] Quit ",
                 Mode::Add | Mode::Insert | Mode::Edit => " [Tab] Switch Field | [Enter] Submit | [Esc] Cancel ",
                 Mode::ConfirmDelete => " [y] Confirm Delete | [n/Esc] Cancel ",
-                Mode::Filter => " Type to Filter | [Enter] Apply | [Esc] Clear ",
+                Mode::Filter => " Filter: ",
                 Mode::Error => " [Esc/Enter] Dismiss Error ",
                 Mode::Detail => " [j/k] Scroll | [Esc/Enter/v] Close ",
                 Mode::FatalError => " [r] Retry | [q] Quit ",
+                Mode::NetworkEdit => " [Tab] Field | [Enter] Review | [Esc] Cancel ",
+                Mode::NetworkConfirm => " [y] Apply | [n/Esc] Cancel ",
             };
 
             let footer_layout = Layout::default()
@@ -611,7 +1077,14 @@ async fn main() -> Result<()> {
                 .split(chunks[2]);
 
             let footer_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
-            f.render_widget(Paragraph::new(footer_text).block(footer_block.clone()), footer_layout[0]);
+            if app.mode == Mode::Filter {
+                let inner = footer_block.inner(footer_layout[0]);
+                f.render_widget(footer_block.clone().title(" Filter (live) "), footer_layout[0]);
+                f.render_widget(Paragraph::new(app.filter.value.as_str()), inner);
+                f.set_cursor((inner.x + app.filter.cursor as u16).min(inner.right().saturating_sub(1)), inner.y);
+            } else {
+                f.render_widget(Paragraph::new(footer_text).block(footer_block.clone()), footer_layout[0]);
+            }
             f.render_widget(
                 Paragraph::new(format!(" Status: {}", app.status_msg))
                     .style(Style::default().fg(Color::LightBlue))
@@ -705,20 +1178,7 @@ async fn main() -> Result<()> {
                     );
                     f.render_widget(p, area);
                 }
-                Mode::Filter => {
-                    let area = centered_rect(50, 15, f.size());
-                    f.render_widget(Clear, area);
-                    let block = Block::default()
-                        .title(" Filter Rules (Enter=Apply, Esc=Clear) ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow));
-                    let inner = block.inner(area);
-                    f.render_widget(block, area);
-                    f.render_widget(Paragraph::new(app.filter.value.as_str()), inner);
-                    let max_x = inner.x + inner.width.saturating_sub(1);
-                    let cursor_x = (inner.x + app.filter.cursor as u16).min(max_x);
-                    f.set_cursor(cursor_x, inner.y);
-                }
+                Mode::Filter => {}
                 Mode::Detail => {
                     if let Some(rule) = app.selected_rule() {
                         let area = centered_rect(80, 70, f.size());
@@ -739,6 +1199,61 @@ async fn main() -> Result<()> {
         tokio::select! {
             Some(key) = rx.recv() => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { break; }
+                if app.section == Section::Network && app.mode != Mode::Normal {
+                    match app.mode {
+                        Mode::NetworkEdit => match key.code {
+                            KeyCode::Esc => { app.network_form = None; app.mode = Mode::Normal; }
+                            KeyCode::Tab => if let Some(form) = app.network_form.as_mut() { form.field_idx = (form.field_idx + 1) % form.fields.len(); },
+                            KeyCode::BackTab => if let Some(form) = app.network_form.as_mut() { form.field_idx = if form.field_idx == 0 { form.fields.len() - 1 } else { form.field_idx - 1 }; },
+                            KeyCode::Left => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].left(); },
+                            KeyCode::Right => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].right(); },
+                            KeyCode::Home => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].home(); },
+                            KeyCode::End => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].end(); },
+                            KeyCode::Backspace => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].backspace(); },
+                            KeyCode::Delete => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].delete(); },
+                            KeyCode::Char(c) => if let Some(form) = app.network_form.as_mut() { form.fields[form.field_idx].insert(c); },
+                            KeyCode::Enter => { app.network_action = "Review the values below before applying.".into(); app.mode = Mode::NetworkConfirm; },
+                            _ => {}
+                        },
+                        Mode::NetworkConfirm => match key.code {
+                            KeyCode::Esc | KeyCode::Char('n') => { app.network_form = None; app.mode = Mode::Normal; }
+                            KeyCode::Char('y') => {
+                                let result = if let (Some(profile), Some(form)) = (app.profiles.get(app.network_selected).cloned(), app.network_form.as_ref()) {
+                                    let values: Vec<String> = form.fields.iter().map(|f| f.value.trim().to_string()).collect();
+                                    if app.network_action.starts_with("delete") { if let Some(route) = profile.routes.get(app.network_route_selected) { network::remove_route(&profile, route).await } else { Ok(()) } }
+                                    else if form.title == "IPv4 configuration" { network::save_ipv4(&profile, &values[0], &values[1], &values[2], &values[3]).await }
+                                    else if form.title == "DNS configuration" { network::save_dns(&profile, &values[0], &values[1]).await }
+                                    else { let route = network::Route { destination: values[0].clone(), gateway: values[1].clone(), metric: values[2].clone() }; let old = if app.network_action.starts_with("edit") { profile.routes.get(app.network_route_selected) } else { None }; network::save_route(&profile, old, &route).await }
+                                } else { Ok(()) };
+                                match result { Ok(()) => match network::load_profiles().await { Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.status_msg = "Persistent network configuration updated".into(); app.network_form = None; app.mode = Mode::Normal; }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } }
+                            }
+                            _ => {}
+                        },
+                        Mode::Error => if matches!(key.code, KeyCode::Esc | KeyCode::Enter) { app.mode = Mode::Normal; },
+                        _ => {}
+                    }
+                    continue;
+                }
+                if app.section == Section::Network && app.mode == Mode::Normal {
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Tab => app.network_focus = !app.network_focus,
+                            KeyCode::Char('j') | KeyCode::Down if app.network_focus => { if !app.profiles.is_empty() { app.network_selected = (app.network_selected + 1).min(app.profiles.len() - 1); app.network_route_selected = 0; } },
+                            KeyCode::Char('k') | KeyCode::Up if app.network_focus => { app.network_selected = app.network_selected.saturating_sub(1); app.network_route_selected = 0; },
+                            KeyCode::Char('j') | KeyCode::Down if app.network_tab == NetworkTab::Routes => if let Some(p) = app.profiles.get(app.network_selected) { app.network_route_selected = (app.network_route_selected + 1).min(p.routes.len().saturating_sub(1)); },
+                            KeyCode::Char('k') | KeyCode::Up if app.network_tab == NetworkTab::Routes => app.network_route_selected = app.network_route_selected.saturating_sub(1),
+                        KeyCode::Char('h') | KeyCode::Left if !app.network_focus => app.network_tab = app.network_tab.previous(),
+                        KeyCode::Char('l') | KeyCode::Right if !app.network_focus => app.network_tab = app.network_tab.next(),
+                        KeyCode::Char('r') => match network::load_profiles().await { Ok(p) => { app.profiles = p; app.network_selected = app.network_selected.min(app.profiles.len().saturating_sub(1)); app.status_msg = "Network refreshed".into(); }, Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; } },
+                        KeyCode::Char('f') => { app.section = Section::Firewall; app.network_focus = false; },
+                        KeyCode::Char('e') => if let Some(p) = app.profiles.get(app.network_selected) { app.network_form = Some(match app.network_tab { NetworkTab::Ipv4 => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.ipv4_method), TextField::from(&p.addresses.join(", ")), TextField::from(&p.gateway), TextField::from(&p.metric)], title: "IPv4 configuration".into() }, NetworkTab::Dns => NetworkForm { field_idx: 0, fields: vec![TextField::from(&p.dns.join(", ")), TextField::from(&p.search.join(", "))], title: "DNS configuration".into() }, NetworkTab::Routes => if let Some(route) = p.routes.get(app.network_route_selected) { NetworkForm { field_idx: 0, fields: vec![TextField::from(&route.destination), TextField::from(&route.gateway), TextField::from(&route.metric)], title: "Edit persistent route".into() } } else { NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() } }, NetworkTab::General => { app.status_msg = "General profile fields are read-only in this version".into(); continue; } }); app.network_action = if app.network_tab == NetworkTab::Routes { "edit persistent route".into() } else { "Review the persistent change".into() }; app.mode = Mode::NetworkEdit; },
+                        KeyCode::Char('a') if app.network_tab == NetworkTab::Routes => if app.profiles.get(app.network_selected).is_some() { app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default(), TextField::default(), TextField::from("100")], title: "Add persistent route".into() }); app.network_action = "Review adding this persistent route".into(); app.mode = Mode::NetworkEdit; },
+                        KeyCode::Char('d') if app.network_tab == NetworkTab::Routes => if let Some(p) = app.profiles.get(app.network_selected) { if let Some(route) = p.routes.get(app.network_route_selected) { app.network_action = format!("delete route {} via {}", route.destination, route.gateway); app.network_form = Some(NetworkForm { field_idx: 0, fields: vec![TextField::default()], title: "Delete persistent route".into() }); app.mode = Mode::NetworkConfirm; } },
+                        KeyCode::Char('?') => { app.error_msg = "Network: Tab switches pane; h/l switches tabs; j/k selects profiles or routes; e edits IPv4/DNS/routes; a adds a route; d removes a route; r refreshes; f returns to Firewall; q quits.".into(); app.mode = Mode::Error; },
+                        _ => {}
+                    }
+                    continue;
+                }
                 match app.mode {
                     Mode::Normal => match key.code {
                         KeyCode::Char('q') => break,
@@ -776,9 +1291,14 @@ async fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Char('/') => app.mode = Mode::Filter,
+                        KeyCode::Char('?') => { app.error_msg = "Firewall: Tab switches pane; j/k navigates; a adds; i inserts; e edits; x deletes; v opens details; / filters live; r refreshes; n opens Network; q quits.".into(); app.mode = Mode::Error; },
                         KeyCode::Char('r') => match fetch_ruleset().await {
                             Ok(r) => { app.rules = r; app.update_sidebar(); app.recompute_visible(); app.status_msg = "Refreshed".to_string(); }
                             Err(e) => app.status_msg = format!("Refresh failed: {}", e),
+                        },
+                        KeyCode::Char('n') => match network::load_profiles().await {
+                            Ok(p) => { app.profiles = p; app.network_selected = 0; app.section = Section::Network; app.network_focus = true; app.status_msg = "Network loaded".into(); }
+                            Err(e) => { app.error_msg = e.to_string(); app.mode = Mode::Error; }
                         },
                         _ => {}
                     },
@@ -792,13 +1312,13 @@ async fn main() -> Result<()> {
                         KeyCode::Esc => app.mode = Mode::Normal,
                         KeyCode::Tab => app.form.next_field(),
                         KeyCode::BackTab => app.form.prev_field(),
-                        KeyCode::Left => app.form.active_field_mut().left(),
-                        KeyCode::Right => app.form.active_field_mut().right(),
-                        KeyCode::Home => app.form.active_field_mut().home(),
-                        KeyCode::End => app.form.active_field_mut().end(),
-                        KeyCode::Delete => app.form.active_field_mut().delete(),
-                        KeyCode::Backspace => app.form.active_field_mut().backspace(),
-                        KeyCode::Char(c) => app.form.active_field_mut().insert(c),
+                        KeyCode::Left if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().left(),
+                        KeyCode::Right if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().right(),
+                        KeyCode::Home if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().home(),
+                        KeyCode::End if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().end(),
+                        KeyCode::Delete if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().delete(),
+                        KeyCode::Backspace if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().backspace(),
+                        KeyCode::Char(c) if !app.form.location_locked || app.form.field_idx == 3 => app.form.active_field_mut().insert(c),
                         KeyCode::Enter => {
                             let family = app.form.family.value.clone();
                             let table = app.form.table.value.clone();
@@ -821,7 +1341,7 @@ async fn main() -> Result<()> {
                                                 family,
                                                 table,
                                                 chain,
-                                                "position".into(),
+                                                "handle".into(),
                                                 rule.handle.to_string(),
                                                 statement,
                                             ];
@@ -946,6 +1466,7 @@ async fn main() -> Result<()> {
                         },
                         _ => {}
                     },
+                    Mode::NetworkEdit | Mode::NetworkConfirm => {}
                 }
             }
             _ = refresh_interval.tick() => {
@@ -960,6 +1481,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    input_running.store(false, Ordering::Relaxed);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
