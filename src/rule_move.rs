@@ -104,7 +104,7 @@ impl RuleMovePlan {
             "add"
         };
         format!(
-            "{command} rule {} {} {} handle {} {}\ndelete rule {} {} {} handle {}\n",
+            "{command} rule {} {} {} position {} {}\ndelete rule {} {} {} handle {}\n",
             self.family,
             self.table,
             self.chain,
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(plan.destination_index, 0);
         assert!(plan
             .script()
-            .starts_with("insert rule inet pintech input handle 10 drop"));
+            .starts_with("insert rule inet pintech input position 10 drop"));
         assert!(plan.script().ends_with("handle 20\n"));
     }
 
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(plan.destination_index, 1);
         assert!(plan
             .script()
-            .starts_with("add rule inet pintech input handle 20 accept"));
+            .starts_with("add rule inet pintech input position 20 accept"));
         assert!(RuleMovePlan::build(&rules, &rules[0], RuleMoveDirection::Up).is_err());
         assert!(RuleMovePlan::build(&rules, &rules[1], RuleMoveDirection::Down).is_err());
     }
